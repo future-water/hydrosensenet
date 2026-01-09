@@ -332,7 +332,7 @@ class NWMDataLoader:
 
         # Save if requested
         if output_file:
-            from hydro_sensor_network.io import save_streamflow
+            from hydrosensenet.io import save_streamflow
             save_streamflow(df_combined, output_file, format=format)
             print(f"  Saved to: {output_file}")
 
