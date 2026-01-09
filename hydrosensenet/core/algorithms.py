@@ -148,9 +148,7 @@ def qr_pivot_selection(
         selected_sensor_indices.extend(chosen_positions)
 
         # Store selected locations info
-        selected = group.loc[
-            group['col_pos'].isin(chosen_positions)
-        ].copy()
+        selected = (group.set_index('col_pos').loc[chosen_positions].reset_index())
         selected_rows.append(selected)
 
     # Combine all selected locations

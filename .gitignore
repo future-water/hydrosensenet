@@ -133,11 +133,20 @@ dmypy.json
 .DS_Store
 Thumbs.db
 
+# folders
+**/texas_gulf/
+**/cache/
+
 # Data files (optional - uncomment if needed)
-# *.csv
-# *.nc
-# *.grib
-# *.shp
-# *.shx
-# *.dbf
-# *.prj
+*.csv
+*.nc
+*.grib
+*.shp
+*.shx
+*.dbf
+*.prj
+*.geojson
+*.parquet
+*.png
+*.txt
+*.gdb
