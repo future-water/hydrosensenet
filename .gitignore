@@ -135,18 +135,20 @@ Thumbs.db
 
 # folders
 **/texas_gulf/
+**/brazil/
+**/bangladesh/
 **/cache/
 
 # Data files (optional - uncomment if needed)
-*.csv
-*.nc
-*.grib
-*.shp
-*.shx
-*.dbf
-*.prj
-*.geojson
-*.parquet
-*.png
-*.txt
-*.gdb
+#*.csv
+#*.nc
+#*.grib
+#*.shp
+#*.shx
+#*.dbf
+#*.prj
+#*.geojson
+#*.parquet
+#*.png
+#*.txt
+#*.gdb

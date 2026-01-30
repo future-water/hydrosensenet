@@ -2,13 +2,19 @@
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import geopandas as gpd
 from pathlib import Path
-from typing import Union, List, Optional, Dict
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from matplotlib.colors import TwoSlopeNorm
+from scipy.interpolate import griddata
+from typing import Union, Tuple, List, Optional, Dict
 import warnings
+import time
 
 from .data import load_streamflow_data, prepare_gauge_locations, split_timeseries, prepare_matrix
-from .core import sensor_placement_qr, calculate_performance_metrics, reconstruction_evaluation
+from .core import sensor_placement_qr, qr_pivot_selection, calculate_performance_metrics, reconstruction_evaluation
 from .spatial import calculate_spatial_weights
 
 
@@ -132,7 +138,7 @@ class SensorNetworkDesigner:
         labels = comid_order
 
         return cls(matrix, locations_filtered, labels)
-
+    
     def design_network(
         self,
         n_sensors: int,
@@ -141,17 +147,80 @@ class SensorNetworkDesigner:
         existing_sensors: Optional[List[int]] = None,
         train_frac: float = 0.7,
         evaluate: bool = True,
-        verbose: bool = True
+        verbose: bool = True,
+        # New regional parameters
+        region_column: Optional[str] = None,
+        sensors_per_region: Optional[Dict[str, int]] = None
     ) -> 'NetworkDesignResult':
-        """Design optimal sensor network."""
-        import time
+        """
+        Design optimal sensor network.
+        
+        Parameters
+        ----------
+        n_sensors : int
+            Total number of sensors to select (ignored if sensors_per_region is provided)
+        weights : array-like or Path, optional
+            Importance weights for locations
+        weight_column : str, optional
+            Column name for weights if loading from file
+        existing_sensors : list of int, optional
+            Indices of existing sensors to keep
+        train_frac : float
+            Fraction of data to use for training (default: 0.7)
+        evaluate : bool
+            Whether to evaluate reconstruction performance (default: True)
+        verbose : bool
+            Print progress messages (default: True)
+        region_column : str, optional
+            Column name in self.locations containing region assignments.
+            If provided, performs regional QR selection instead of global.
+        sensors_per_region : dict, optional
+            Dictionary mapping region names to number of sensors per region.
+            Required if region_column is provided.
+            
+        Returns
+        -------
+        NetworkDesignResult
+            Results object with selected sensors and performance metrics
+            
+        Examples
+        --------
+        # Global selection (original behavior)
+        result = designer.design_network(n_sensors=50)
+        
+        # Regional selection
+        result = designer.design_network(
+            n_sensors=None,  # ignored when using regional
+            region_column='basin_name',
+            sensors_per_region={'Basin_A': 10, 'Basin_B': 15, 'Basin_C': 5}
+        )
+        """
+        # Validate regional parameters
+        use_regional = region_column is not None
+        if use_regional:
+            if sensors_per_region is None:
+                raise ValueError("sensors_per_region must be provided when using region_column")
+            if region_column not in self.locations.columns:
+                raise ValueError(f"Column '{region_column}' not found in locations GeoDataFrame")
+            # Calculate total sensors from regional allocation
+            total_sensors = sum(sensors_per_region.values())
+        else:
+            total_sensors = n_sensors
 
         if verbose:
             print(f"\n{'='*70}")
             print(f"SENSOR NETWORK DESIGN")
             print(f"{'='*70}")
             print(f"Input data: {self.streamflow_data.shape[0]:,} timesteps × {self.streamflow_data.shape[1]:,} locations")
-            print(f"Target sensors: {n_sensors}")
+            if use_regional:
+                print(f"Mode: Regional selection")
+                print(f"Region column: {region_column}")
+                print(f"Total sensors: {total_sensors} across {len(sensors_per_region)} regions")
+                for region, count in sensors_per_region.items():
+                    print(f"  - {region}: {count} sensors")
+            else:
+                print(f"Mode: Global selection")
+                print(f"Target sensors: {n_sensors}")
             print(f"Evaluation: {'Enabled' if evaluate else 'Disabled'}")
 
         # Process weights
@@ -197,6 +266,41 @@ class SensorNetworkDesigner:
             if verbose:
                 print(f"\n[3/4] Using {n_sensors} existing sensor locations (skipping QR)...")
             selected_indices = np.array(existing_sensors)
+        
+        elif use_regional:
+            # Regional QR selection
+            if verbose:
+                print(f"\n[3/4] Running regional QR decomposition...")
+                print(f"      Matrix size: {X_train.shape[0]:,} × {X_train.shape[1]:,}")
+                start_time = time.time()
+            
+            # Prepare region assignments DataFrame
+            region_assignments = pd.DataFrame({
+                region_column: self.locations[region_column],
+                'col_pos': np.arange(len(self.locations))
+            })
+            
+            # Apply weights if provided (note: qr_pivot_selection doesn't support weights yet)
+            if weight_array is not None and verbose:
+                warnings.warn(
+                    "Weights are not currently supported with regional selection. "
+                    "Consider implementing weighted regional QR if needed."
+                )
+            
+            # Call qr_pivot_selection
+            selected_locations_df, selected_indices = qr_pivot_selection(
+                X_train,
+                region_assignments,
+                sensors_per_region,
+                region_column=region_column
+            )
+            
+            selected_indices = np.array(selected_indices)
+            
+            if verbose:
+                print(f"      ✓ Regional QR completed in {time.time() - start_time:.2f}s")
+                print(f"      ✓ Selected {len(selected_indices)} sensor locations")
+        
         else:
             # Run QR decomposition to find optimal locations
             if verbose:
@@ -251,7 +355,10 @@ class SensorNetworkDesigner:
                 'eval_results': eval_results
             } if evaluate else None,
             n_sensors=n_sensors,
-            weights=weight_array
+            weights=weight_array,
+            region_column=region_column if use_regional else None,
+            sensors_per_region=sensors_per_region if use_regional else None,
+            all_locations=self.locations
         )
 
         if verbose:
@@ -272,7 +379,10 @@ class NetworkDesignResult:
         location_labels: List[str],
         performance_metrics: Optional[Dict],
         n_sensors: int,
-        weights: Optional[np.ndarray]
+        weights: Optional[np.ndarray],
+        region_column: Optional[str] = None,
+        sensors_per_region: Optional[Dict[str, int]] = None,
+        all_locations: Optional[gpd.GeoDataFrame] = None
     ):
         self.selected_indices = selected_indices
         self.locations = locations
@@ -280,6 +390,9 @@ class NetworkDesignResult:
         self.performance_metrics = performance_metrics
         self.n_sensors = n_sensors
         self.weights = weights
+        self.region_column = region_column
+        self.sensors_per_region = sensors_per_region
+        self.all_locations = all_locations
 
     def print_summary(self):
         """Print summary of results."""
@@ -287,6 +400,12 @@ class NetworkDesignResult:
         print(f"SENSOR NETWORK DESIGN RESULTS")
         print(f"{'='*60}")
         print(f"Number of sensors selected: {self.n_sensors}")
+
+        if self.region_column and self.sensors_per_region:
+            print(f"\nREGIONAL ALLOCATION:")
+            for region, count in self.sensors_per_region.items():
+                print(f"  {region}: {count} sensors")
+        
         print(f"Selected locations: {self.selected_indices[:10]}..." if len(self.selected_indices) > 10 else f"Selected locations: {self.selected_indices}")
 
         if self.performance_metrics:
@@ -408,6 +527,10 @@ class NetworkDesignResult:
             'latitude': lats
         })
 
+        # Add region information if available
+        if self.region_column:
+            df['region'] = self.locations[self.region_column].values
+
         if self.performance_metrics:
             r2 = self.performance_metrics.get('r2')
             nse = self.performance_metrics.get('nse')
@@ -420,360 +543,424 @@ class NetworkDesignResult:
                 df['nnse'] = nnse[self.selected_indices]
 
         return df
-
-    def plot(
+    
+    def plot_sensors(
         self,
-        figsize=(12, 8),
-        show_rank=True,
-        basemap=True,
-        title="Optimal Sensor Network Design",
-        save_path=None,
-        flowlines_gdf=None,
-        rank_column='Median Rank'
-    ):
-        """Create map visualization of selected sensors."""
-        import matplotlib.pyplot as plt
-        import cartopy.crs as ccrs
-        import cartopy.feature as cfeature
-        from matplotlib.collections import LineCollection
-        from matplotlib.colors import Normalize
-
-        # Use Lambert Conformal projection if flowlines provided, otherwise PlateCarree
-        if flowlines_gdf is not None:
-            proj = ccrs.LambertConformal(
-                central_latitude=33,
-                central_longitude=-96,
-                standard_parallels=(33.0, 45.0)
-            )
-        else:
-            proj = ccrs.PlateCarree()
-
-        # Create figure with geographic projection
-        fig, ax = plt.subplots(
-            figsize=figsize,
-            dpi=600,
-            subplot_kw={'projection': proj}
-        )
-
-        # Configure axis
-        if flowlines_gdf is not None:
-            ax.set_extent([-106.65, -93.0, 25.0, 36.5], crs=ccrs.PlateCarree())
-            ax.spines['geo'].set_visible(False)
-        else:
-            # Set extent based on sensor locations
-            # Convert to centroids if geometries are not Points
-            if self.locations.geometry.geom_type.iloc[0] != 'Point':
-                locations_proj = self.locations.to_crs("EPSG:5070")
-                centroids = locations_proj.geometry.centroid.to_crs(self.locations.crs)
-                lons = centroids.x
-                lats = centroids.y
-            else:
-                lons = self.locations.geometry.x
-                lats = self.locations.geometry.y
-            margin = 0.5
-            ax.set_extent([
-                lons.min() - margin, lons.max() + margin,
-                lats.min() - margin, lats.max() + margin
-            ])
-
-        # Plot flowlines if provided
-        if flowlines_gdf is not None:
-            # Project flowlines to map projection
-            flowlines_proj = flowlines_gdf.to_crs(proj.proj4_params)
-
-            # First layer: thin black outline for contrast
-            lines_outline = LineCollection(
-                [np.array(geometry.xy).T for geometry in flowlines_proj.geometry],
-                linewidths=0.025,
-                alpha=0.8,
-                color='black',
-                zorder=1
-            )
-            ax.add_collection(lines_outline)
-
-            # Second layer: colored lines by rank
-            lines = LineCollection(
-                [np.array(geometry.xy).T for geometry in flowlines_proj.geometry],
-                linewidths=1,
-                alpha=1,
-                zorder=1
-            )
-            lines.set_array(flowlines_proj[rank_column])
-            lines.set_cmap('viridis_r')
-            ax.add_collection(lines)
-
-            # Add colorbar for flowlines
-            cb_ax = fig.add_axes([0.85, 0.2, 0.02, 0.6])
-            cb = fig.colorbar(lines, cax=cb_ax, orientation='vertical', label='Sensor Rank')
-
-            # Add legend (matches original even though no labeled elements)
-            ax.legend(frameon=False, loc='best')
-
-            plt.subplots_adjust(left=0.05, right=0.8, top=0.95, bottom=0.1)
-        else:
-            # Original scatter plot for sensors
-            # Convert to centroids if geometries are not Points
-            if self.locations.geometry.geom_type.iloc[0] != 'Point':
-                locations_proj = self.locations.to_crs("EPSG:5070")
-                centroids = locations_proj.geometry.centroid.to_crs(self.locations.crs)
-                lons = centroids.x
-                lats = centroids.y
-            else:
-                lons = self.locations.geometry.x
-                lats = self.locations.geometry.y
-
-            # Color by rank (lower rank = more important)
-            scatter = ax.scatter(
-                lons, lats,
-                c=range(1, len(lons) + 1),
-                cmap='RdYlGn_r',
-                s=100,
-                edgecolor='black',
-                linewidth=0.5,
-                alpha=0.8,
-                transform=ccrs.PlateCarree(),
-                zorder=5
-            )
-
-            # Add rank numbers if requested
-            if show_rank and len(lons) <= 50:
-                for i, (lon, lat) in enumerate(zip(lons, lats)):
-                    ax.text(
-                        lon, lat, str(i+1),
-                        fontsize=6,
-                        ha='center', va='center',
-                        color='white',
-                        weight='bold',
-                        transform=ccrs.PlateCarree(),
-                        zorder=6
-                    )
-
-            # Add colorbar for sensors
-            cbar = plt.colorbar(scatter, ax=ax, pad=0.02, shrink=0.8)
-            cbar.set_label('Sensor Rank (1 = highest priority)', rotation=270, labelpad=15)
-
-            # Add gridlines
-            gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.3)
-            gl.top_labels = False
-            gl.right_labels = False
-
-            plt.tight_layout()
-
-        # Add basemap features
-        if basemap:
-            ax.add_feature(cfeature.BORDERS, linestyle='-', alpha=.2)
-            ax.add_feature(cfeature.STATES, linestyle=':', alpha=.2)
-
-        # Add title
-        if title:
-            ax.set_title(title, fontsize=14, weight='bold', pad=10)
-
-        # Add performance metrics if available (only for scatter plot mode)
-        if flowlines_gdf is None and self.performance_metrics:
-            r2 = self.performance_metrics.get('r2')
-            nse = self.performance_metrics.get('nse')
-            text_parts = []
-            if r2 is not None:
-                text_parts.append(f"Mean R²: {np.nanmean(r2):.3f}")
-            if nse is not None:
-                text_parts.append(f"Mean NSE: {np.nanmean(nse):.3f}")
-            if text_parts:
-                ax.text(
-                    0.02, 0.98, '\n'.join(text_parts),
-                    transform=ax.transAxes,
-                    fontsize=10,
-                    verticalalignment='top',
-                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8)
-                )
-
-        # Save if requested
-        if save_path:
-            plt.savefig(save_path, bbox_inches='tight', dpi=600)
-            print(f"Figure saved to: {save_path}")
-
-        return fig, ax
-
-    def plot_comparison(
-        self,
-        baseline_result: 'NetworkDesignResult',
-        flowlines_gdf: gpd.GeoDataFrame,
-        location_labels: List[str],
-        comparison_labels: Optional[Dict[str, str]] = None,
-        metric: str = 'nnse',
-        figsize=(7, 5),
-        save_path=None,
-        comid_column: Optional[str] = None
+        save_path: Optional[str] = None,
+        figsize: tuple = (8, 6),
+        dpi: int = 600,
+        projection_epsg: str = 'EPSG:3857'
     ):
         """
-        Plot comparison of NNSE between this network and a baseline network.
-
+        Simple plot showing selected sensor locations.
+        
+        Parameters
+        ----------
+        save_path : str, optional
+            Path to save figure
+        figsize : tuple
+            Figure size (width, height)
+        dpi : int
+            Resolution
+        projection_epsg : str
+            EPSG code for centroid calculation if geometries are not Points
+            Default: 'EPSG:3857' (Web Mercator)
+            Alternatives: 'EPSG:5070' (NAD83 Albers for North America), 'EPSG:6933' (Equal Earth)
+            
+        Returns
+        -------
+        fig, ax : matplotlib objects
+        
+        Example
+        -------
+        result = designer.design_network(n_sensors=50)
+        result.plot_sensors(save_path='sensors.png')
+        """
+        # Get coordinates
+        lats, lons = self._get_coordinates(projection_epsg)
+        
+        # Create figure
+        fig = plt.figure(figsize=figsize, dpi=dpi)
+        ax = plt.axes(projection=ccrs.PlateCarree())
+        
+        # Auto extent
+        extent = self._calculate_extent(lons, lats)
+        ax.set_extent(extent, crs=ccrs.PlateCarree())
+        
+        # Plot sensors
+        ax.scatter(
+            lons, lats,
+            marker='o',
+            color='green',
+            s=15,
+            edgecolors='white',
+            linewidth=0.5,
+            transform=ccrs.PlateCarree(),
+            label=f'Selected sensors (n={len(lats)})',
+            zorder=5
+        )
+        
+        # Map features
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.6)
+        ax.add_feature(cfeature.BORDERS, linewidth=0.5, linestyle=':')
+        
+        # Gridlines
+        gl = ax.gridlines(draw_labels=True, linewidth=0.4, color='gray', alpha=0.3, linestyle='--')
+        gl.top_labels = False
+        gl.right_labels = False
+        
+        # Legend
+        ax.legend(loc='upper right', frameon=True, fontsize=9, framealpha=0.9)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, bbox_inches='tight', dpi=dpi, transparent=True)
+            print(f"Figure saved to: {save_path}")
+        
+        return fig, ax
+    
+    def plot_comparison(
+        self,
+        baseline_result,
+        performance_metric: str = 'nnse',
+        flowline_gdf: Optional = None,
+        save_path: Optional[str] = None,
+        figsize: tuple = (8, 6),
+        dpi: int = 600,
+        projection_epsg: str = 'EPSG:3857'
+    ):
+        """
+        Plot comparison showing improvement over baseline.
+        
         Parameters
         ----------
         baseline_result : NetworkDesignResult
-            Baseline network to compare against (e.g., USGS network)
-        flowlines_gdf : GeoDataFrame
-            GeoDataFrame containing flowline geometries with COMID column
-        location_labels : List[str]
-            Labels for all locations (COMIDs) matching the order in performance metrics
-        comparison_labels : dict, optional
-            Dictionary with keys 'optimal' and 'baseline' for scatter plot labels
-        metric : str
-            Performance metric to compare ('nnse', 'nse', or 'r2')
-        figsize : tuple
-            Figure size (width, height)
+            Baseline network to compare against
+        performance_metric : str
+            Performance metric to compare ('nnse', 'nse', 'r2')
+        flowline_gdf : GeoDataFrame, optional
+            Flowlines to plot with performance colors. If None, plots gridded background.
         save_path : str, optional
-            Path to save the figure
-        comid_column : str, optional
-            Name of the COMID column in flowlines_gdf. If None, will auto-detect
-            by trying 'COMID', 'comid', 'feature_id', 'FEATUREID'
-
+            Path to save figure
+        figsize : tuple
+            Figure size
+        dpi : int
+            Resolution
+        projection_epsg : str
+            EPSG code for centroid calculation if geometries are not Points
+            Default: 'EPSG:3857': Web Mercator (global)
+            Common alternatives:
+            - 'EPSG:5070': NAD83 Albers Equal Area (North America)
+            - 'EPSG:3857': Web Mercator (global)
+            - 'EPSG:6933': Equal Earth (global)
+            - 'EPSG:32633': UTM Zone 33N (Europe/Africa)
+            - 'EPSG:32718': UTM Zone 18S (South America)
+            
         Returns
         -------
-        tuple
-            (figure, axis)
+        fig, ax : matplotlib objects
+        
+        Examples
+        --------
+        # Gridded background (no flowlines)
+        optimal.plot_comparison(baseline, performance_metric='nnse')
+        
+        # With flowlines
+        optimal.plot_comparison(baseline, flowline_gdf=flowlines, performance_metric='nnse')
         """
-        import matplotlib.pyplot as plt
-        import cartopy.crs as ccrs
-        import cartopy.feature as cfeature
-        from matplotlib.collections import LineCollection
-        from matplotlib.colors import Normalize
-
-        # Default labels
-        if comparison_labels is None:
-            comparison_labels = {
-                'optimal': 'Optimal sensors',
-                'baseline': 'Baseline sensors'
-            }
-
-        # Get performance metrics
+        # Check if metrics exist
         if not self.performance_metrics or not baseline_result.performance_metrics:
-            raise ValueError("Both results must have performance metrics for comparison")
-
-        optimal_metric = self.performance_metrics.get(metric)
-        baseline_metric = baseline_result.performance_metrics.get(metric)
-
+            raise ValueError("Both results must have performance metrics. Run design_network() with evaluate=True")
+        
+        # Get metrics
+        optimal_metric = self.performance_metrics.get(performance_metric)
+        baseline_metric = baseline_result.performance_metrics.get(performance_metric)
+        
         if optimal_metric is None or baseline_metric is None:
-            raise ValueError(f"Metric '{metric}' not available in both results")
-
-        # Calculate difference (optimal - baseline)
+            raise ValueError(f"Metric '{performance_metric}' not found in results")
+        
+        # Calculate difference
         diff_metric = optimal_metric - baseline_metric
-
-        # Auto-detect COMID column if not specified
-        flowlines_gdf = flowlines_gdf.copy()
-        if comid_column is None:
-            # Try common COMID column names
-            for candidate in ['COMID', 'comid', 'feature_id', 'FEATUREID']:
-                if candidate in flowlines_gdf.columns:
-                    comid_column = candidate
-                    break
-            if comid_column is None:
-                raise ValueError(
-                    f"Could not find COMID column in flowlines_gdf. "
-                    f"Available columns: {list(flowlines_gdf.columns)}. "
-                    f"Please specify comid_column parameter."
-                )
-
-        # Create DataFrame with COMID and difference
-        diff_df = pd.DataFrame({
-            'COMID': location_labels,
-            'diff': diff_metric
-        })
-
-        # Merge with flowlines
-        flowlines_gdf['COMID'] = flowlines_gdf[comid_column].astype(str)
-        diff_df['COMID'] = diff_df['COMID'].astype(str)
-        flowlines_with_diff = flowlines_gdf.merge(diff_df, on='COMID', how='left')
-
-        # Setup projection
-        proj = ccrs.LambertConformal(
-            central_latitude=33,
-            central_longitude=-96,
-            standard_parallels=(33.0, 45.0)
-        )
-
-        # Project flowlines
-        flowlines_proj = flowlines_with_diff.to_crs(proj.proj4_params)
-
+        
+        # Get coordinates
+        opt_lats, opt_lons = self._get_coordinates(projection_epsg)
+        base_lats, base_lons = baseline_result._get_coordinates(projection_epsg)
+        
         # Create figure
-        fig, ax = plt.subplots(
-            figsize=figsize,
-            dpi=600,
-            subplot_kw={'projection': proj}
-        )
-        ax.set_extent([-106.65, -93.0, 25.0, 36.5], crs=ccrs.PlateCarree())
-        ax.spines['geo'].set_visible(False)
-
-        # Plot flowlines with difference colors
-        lines = LineCollection(
-            [np.array(geometry.xy).T for geometry in flowlines_proj.geometry],
-            linewidths=1,
-            alpha=1,
-            zorder=1
-        )
-        norm = Normalize(vmin=-1, vmax=1)
-        lines.set_array(flowlines_proj['diff'])
-        lines.set_cmap('bwr_r')
-        lines.set_norm(norm)
-        ax.add_collection(lines)
-
-        # Add colorbar
-        cb_ax = fig.add_axes([0.85, 0.2, 0.02, 0.6])
-        metric_label = metric.upper() if metric != 'r2' else 'R²'
-        cb = fig.colorbar(
-            lines,
-            cax=cb_ax,
-            orientation='vertical',
-            label=f'Δ{metric_label}'
-        )
-
-        # Prepare sensor centroids for both networks
-        def get_centroids(result):
-            if result.locations.geometry.geom_type.iloc[0] != 'Point':
-                locs_proj = result.locations.to_crs("EPSG:5070")
-                centroids = locs_proj.geometry.centroid.to_crs("EPSG:4326")
-                centroids_gdf = gpd.GeoDataFrame(geometry=centroids, crs="EPSG:4326")
+        fig = plt.figure(figsize=figsize, dpi=dpi)
+        ax = plt.axes(projection=ccrs.PlateCarree())
+        
+        # Set extent
+        all_lons = np.concatenate([opt_lons, base_lons])
+        all_lats = np.concatenate([opt_lats, base_lats])
+        extent = self._calculate_extent(all_lons, all_lats)
+        ax.set_extent(extent, crs=ccrs.PlateCarree())
+        
+        # Plot background metric if flowline_gdf NOT provided
+        if flowline_gdf is None:
+            # Create gridded background 
+            gridded_diff = self._create_grid(diff_metric, performance_metric, projection_epsg=projection_epsg)
+            
+            if gridded_diff is not None:
+                # Check if it's sparse grid or regular grid
+                if isinstance(gridded_diff, dict) and gridded_diff.get('type') == 'sparse':
+                    # Sparse grid - plot as scatter to avoid interpolation artifacts
+                    # Calculate cell size based on grid spacing
+                    unique_lons = np.unique(gridded_diff['lons'])
+                    unique_lats = np.unique(gridded_diff['lats'])
+                    
+                    if len(unique_lons) > 1 and len(unique_lats) > 1:
+                        # Calculate approximate cell size
+                        lon_spacing = np.median(np.diff(np.sort(unique_lons)))
+                        lat_spacing = np.median(np.diff(np.sort(unique_lats)))
+                        
+                        # Convert to figure coordinates for marker size
+                        # This ensures cells touch but don't overlap
+                        ax_extent = ax.get_extent(crs=ccrs.PlateCarree())
+                        ax_width = ax_extent[1] - ax_extent[0]
+                        ax_height = ax_extent[3] - ax_extent[2]
+                        
+                        # Calculate marker size to fill grid cells
+                        # Size in points^2, figure dimensions in data coordinates
+                        marker_size = min(
+                            (figsize[0] * 72 * lon_spacing / ax_width) ** 2,
+                            (figsize[1] * 72 * lat_spacing / ax_height) ** 2
+                        ) * 1.2  # 1.2 factor to ensure cells touch
+                    else:
+                        marker_size = 10
+                    
+                    # Plot as scatter with square markers (grid cells)
+                    norm = TwoSlopeNorm(vmin=-0.5, vcenter=0, vmax=0.5)
+                    im = ax.scatter(
+                        gridded_diff['lons'],
+                        gridded_diff['lats'],
+                        c=gridded_diff['values'],
+                        cmap='bwr_r',
+                        norm=norm,
+                        s=marker_size,
+                        marker='s',  # Square markers
+                        edgecolors='none',
+                        transform=ccrs.PlateCarree(),
+                        alpha=0.8,
+                        zorder=1
+                    )
+                else:
+                    # Regular dense grid - use pcolormesh
+                    norm = TwoSlopeNorm(vmin=-0.5, vcenter=0, vmax=0.5)
+                    im = ax.pcolormesh(
+                        gridded_diff.columns.values,
+                        gridded_diff.index.values,
+                        gridded_diff.values,
+                        cmap='bwr_r',
+                        norm=norm,
+                        shading='auto',
+                        transform=ccrs.PlateCarree(),
+                        alpha=0.8
+                    )
+                
+                # Colorbar
+                cbar = plt.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
+                metric_label = performance_metric.upper() if performance_metric != 'r2' else 'R²'
+                cbar.set_label(f"Δ {metric_label}")
+        
+        else:
+            # Plot flowlines with metric colors
+            from matplotlib.collections import LineCollection
+            from matplotlib.colors import Normalize
+            
+            # Merge diff_metric with flowlines
+            # Assume flowlines has COMID or similar ID matching location_labels
+            diff_df = pd.DataFrame({
+                'location_id': self.location_labels,
+                'diff': diff_metric
+            })
+            
+            # Try common ID columns
+            id_col = None
+            for col in ['COMID', 'comid', 'id', 'ID', 'feature_id', 'FEATUREID']:
+                if col in flowline_gdf.columns:
+                    id_col = col
+                    break
+            
+            if id_col is None:
+                print("Warning: Could not find ID column in flowline_gdf. Plotting without flowlines.")
             else:
-                centroids_gdf = result.locations.to_crs("EPSG:4326")
-            return centroids_gdf.to_crs(proj.proj4_params)
-
-        optimal_centroids = get_centroids(self)
-        baseline_centroids = get_centroids(baseline_result)
-
-        # Plot sensors
+                # Merge
+                flowlines_copy = flowline_gdf.copy()
+                flowlines_copy['location_id'] = flowlines_copy[id_col].astype(str)
+                diff_df['location_id'] = diff_df['location_id'].astype(str)
+                flowlines_diff = flowlines_copy.merge(diff_df, on='location_id', how='left')
+                
+                # Project flowlines
+                proj = ccrs.PlateCarree()
+                flowlines_proj = flowlines_diff.to_crs(proj.proj4_params)
+                
+                # Plot as LineCollection
+                lines = LineCollection(
+                    [np.array(geom.xy).T for geom in flowlines_proj.geometry],
+                    linewidths=1.5,
+                    alpha=0.8,
+                    zorder=1
+                )
+                norm = Normalize(vmin=-0.5, vmax=0.5)
+                lines.set_array(flowlines_proj['diff'])
+                lines.set_cmap('bwr_r')
+                lines.set_norm(norm)
+                ax.add_collection(lines)
+                
+                # Colorbar
+                cbar = plt.colorbar(lines, ax=ax, fraction=0.04, pad=0.02)
+                metric_label = performance_metric.upper() if performance_metric != 'r2' else 'R²'
+                cbar.set_label(f"Δ {metric_label}")
+        
+        # Plot baseline sensors
         ax.scatter(
-            baseline_centroids.geometry.x,
-            baseline_centroids.geometry.y,
+            base_lons, base_lats,
+            marker='o',
             color='k',
-            edgecolor='white',
-            linewidths=0.6,
-            alpha=0.8,
-            s=7,
-            label=comparison_labels['baseline'],
-            zorder=5
+            edgecolors='none',
+            s=5,
+            alpha=0.5,
+            label=f'Baseline (n={len(base_lats)})',
+            transform=ccrs.PlateCarree(),
+            zorder=4
         )
-
+        
+        # Plot optimal sensors
         ax.scatter(
-            optimal_centroids.geometry.x,
-            optimal_centroids.geometry.y,
+            opt_lons, opt_lats,
+            marker='o',
             color='green',
-            edgecolor='white',
-            linewidths=0.6,
-            alpha=0.8,
-            s=7,
-            label=comparison_labels['optimal'],
+            s=10,
+            edgecolors='white',
+            linewidth=0.3,
+            label=f'Reconfigured sensors',
+            transform=ccrs.PlateCarree(),
             zorder=5
         )
-
-        # Add map features and legend
-        ax.add_feature(cfeature.BORDERS, linestyle='-', alpha=.2)
-        ax.add_feature(cfeature.STATES, linestyle=':', alpha=.2)
-        ax.legend(frameon=False, loc='best')
-
-        plt.subplots_adjust(left=0.05, right=0.8, top=0.95, bottom=0.1)
-
-        # Save if requested
+        
+        # Map features
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.6)
+        ax.add_feature(cfeature.BORDERS, linewidth=0.5, linestyle=':')
+        
+        # Gridlines
+        gl = ax.gridlines(draw_labels=True, linewidth=0.4, color='gray', alpha=0.3, linestyle='--')
+        gl.top_labels = False
+        gl.right_labels = False
+        
+        # Legend
+        ax.legend(loc='upper right', frameon=True, fontsize=9, framealpha=0.9)
+        
+        plt.tight_layout()
+        
         if save_path:
-            plt.savefig(save_path, bbox_inches='tight', dpi=600)
+            plt.savefig(save_path, bbox_inches='tight', dpi=dpi, transparent=True)
             print(f"Figure saved to: {save_path}")
-
+        
         return fig, ax
+    
+    def _get_coordinates(self, projection_epsg='EPSG:3857'):
+        """
+        Extract lat/lon coordinates from locations.
+        
+        Parameters
+        ----------
+        projection_epsg : str
+            EPSG code for equal-area projection (default: 'EPSG:3857' for global)
+            Common alternatives:
+            - 'EPSG:5070': NAD83 Albers Equal Area (North America)
+            - 'EPSG:3857': Web Mercator (global)
+            - 'EPSG:6933': Equal Earth (global)
+        """
+        # Handle both Point and LineString geometries
+        if self.locations.geometry.geom_type.iloc[0] != 'Point':
+            # Convert to centroids using specified projection
+            locations_proj = self.locations.to_crs(projection_epsg)
+            centroids = locations_proj.geometry.centroid.to_crs(self.locations.crs)
+            lons = centroids.x.values
+            lats = centroids.y.values
+        else:
+            lons = self.locations.geometry.x.values
+            lats = self.locations.geometry.y.values
+        
+        return lats, lons
+    
+    def _calculate_extent(self, lons, lats, padding=0.05):
+        """Calculate map extent with padding."""
+        lon_range = lons.max() - lons.min()
+        lat_range = lats.max() - lats.min()
+        
+        extent = [
+            lons.min() - lon_range * padding,
+            lons.max() + lon_range * padding,
+            lats.min() - lat_range * padding,
+            lats.max() + lat_range * padding
+        ]
+        
+        return extent
+    
+    def _create_grid(self, diff_metric, metric_name, grid_resolution=0.1, projection_epsg='EPSG:3857'):
+        """
+        Create gridded version of metric for background plotting.
+        
+        Parameters
+        ----------
+        diff_metric : array
+            Metric differences for all locations
+        metric_name : str
+            Name of the metric
+        grid_resolution : float
+            Grid spacing in degrees
+        projection_epsg : str
+            EPSG code for equal-area projection (default: 'EPSG:3857')
+        """
+        # Need all locations (not just selected) for gridding
+        # Check if we have access to all locations
+        
+        if not hasattr(self, 'all_locations') or self.all_locations is None:
+            # Try to get from parent designer if available
+            if hasattr(self, '_designer') and self._designer is not None:
+                all_locs = self._designer.locations
+            else:
+                # No all_locations available - skip gridding
+                print(f"Warning: Cannot create gridded background. all_locations not found.")
+                print(f"         Modify designer.py to pass all_locations=self.locations when creating NetworkDesignResult.")
+                return None
+        else:
+            all_locs = self.all_locations
+        
+        # Verify we have the right number of metric values
+        if len(diff_metric) != len(all_locs):
+            print(f"Warning: Metric array length ({len(diff_metric)}) doesn't match locations ({len(all_locs)}). Skipping gridded background.")
+            return None
+        
+        # Get all coordinates
+        if all_locs.geometry.geom_type.iloc[0] != 'Point':
+            locs_proj = all_locs.to_crs(projection_epsg)
+            centroids = locs_proj.geometry.centroid.to_crs(all_locs.crs)
+            all_lons = centroids.x.values
+            all_lats = centroids.y.values
+        else:
+            all_lons = all_locs.geometry.x.values
+            all_lats = all_locs.geometry.y.values
+        
+        # Check if data is on a regular grid (even if sparse)
+        unique_lats = np.unique(all_lats)
+        unique_lons = np.unique(all_lons)
+        n_unique_lats = len(unique_lats)
+        n_unique_lons = len(unique_lons)
+        
+        print(f"Grid info: {n_unique_lats} unique lats × {n_unique_lons} unique lons = {n_unique_lats * n_unique_lons} possible cells")
+        print(f"           {len(all_lats)} actual locations ({100*len(all_lats)/(n_unique_lats * n_unique_lons):.1f}% coverage)")
+        
+        # For sparse grids, return coordinates and values directly
+        # This will be plotted with scatter() instead of pcolormesh()
+        # to avoid interpolation artifacts
+        
+        return {
+            'type': 'sparse',
+            'lons': all_lons,
+            'lats': all_lats,
+            'values': diff_metric
+        }
