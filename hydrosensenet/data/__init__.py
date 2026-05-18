@@ -1,8 +1,9 @@
 """Data loading and preprocessing for any streamflow data source."""
 
+from .fema import load_nri
 from .loaders import load_streamflow_data, prepare_gauge_locations
-from .preprocessors import split_timeseries, prepare_matrix, filter_valid_data
 from .nwm import NWMDataLoader, get_huc_info, list_available_hucs
+from .preprocessors import filter_valid_data, prepare_matrix, split_timeseries
 from .usgs import download_usgs_gauges, load_usgs_gauges, match_usgs_to_nwm
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     "download_usgs_gauges",
     "load_usgs_gauges",
     "match_usgs_to_nwm",
+    "load_nri",
 ]

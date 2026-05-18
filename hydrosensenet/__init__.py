@@ -46,12 +46,12 @@ from .data import (
     split_timeseries,
     prepare_matrix,
     filter_valid_data,
+    load_nri,
 )
 
 # Spatial operations
 from .spatial import (
     calculate_spatial_weights,
-    load_risk_data,
 )
 
 # I/O utilities (optimized for Parquet)
@@ -118,10 +118,10 @@ __all__ = [
     "split_timeseries",
     "prepare_matrix",
     "filter_valid_data",
+    "load_nri",
 
     # SPATIAL OPERATIONS
     "calculate_spatial_weights",
-    "load_risk_data",
 
     # I/O UTILITIES
     "save_streamflow",

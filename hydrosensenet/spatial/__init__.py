@@ -1,8 +1,7 @@
 """Spatial operations for sensor network design."""
 
-from .weights import calculate_spatial_weights, load_risk_data
+from .weights import calculate_spatial_weights
 
 __all__ = [
     "calculate_spatial_weights",
-    "load_risk_data",
 ]
