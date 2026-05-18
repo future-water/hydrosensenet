@@ -4,10 +4,6 @@ hydrosensenet - Optimal sensor placement for hydrological monitoring networks
 This package provides tools for optimal sensor placement in hydrological monitoring networks
 using QR decomposition and risk-informed optimization approaches.
 
-Reference:
-Oh, J., Lee, J., Bartos, M. Scalable, adaptive and risk-informed design of hydrological
-sensor networks. Nat Water (2025). https://doi.org/10.1038/s44221-025-00496-7
-
 Quick Start
 -----------
 >>> from hydrosensenet import SensorNetworkDesigner

@@ -12,7 +12,13 @@ pip install -e .  # development mode
 
 ## Quick Start
 
-See [design_texas_gulf.ipynb](design_texas_gulf.ipynb) for a complete example with data download and network comparison.
+### Examples
+
+- [design_texas_gulf_baseline.ipynb](design_texas_gulf_baseline.ipynb) - Baseline HUC2-scale design with data download and USGS network comparison
+- [design_texas_gulf_flexible.ipynb](design_texas_gulf_flexible.ipynb) - Flexible planning: per-HUC6 batch design across sub-basins
+- [design_texas_gulf_risk.ipynb](design_texas_gulf_risk.ipynb) - Risk-aware design using FEMA flood-risk weights
+
+### Basic Usage
 
 ```python
 from hydrosensenet import SensorNetworkDesigner
