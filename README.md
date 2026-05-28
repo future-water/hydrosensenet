@@ -17,6 +17,7 @@ pip install -e .  # development mode
 - [design_texas_gulf_baseline.ipynb](design_texas_gulf_baseline.ipynb) - Baseline HUC2-scale design with data download and USGS network comparison
 - [design_texas_gulf_flexible.ipynb](design_texas_gulf_flexible.ipynb) - Flexible planning: per-HUC6 batch design across sub-basins
 - [design_texas_gulf_risk.ipynb](design_texas_gulf_risk.ipynb) - Risk-aware design using FEMA flood-risk weights
+- [design_glofas_brazil.ipynb](design_glofas_brazil.ipynb) - Design in Brazil using GloFAS data
 
 ### Basic Usage
 
