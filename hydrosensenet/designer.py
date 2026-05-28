@@ -1,779 +1,616 @@
-"""High-level API for sensor network design - Simple interface for water managers."""
+"""High-level sensor network design API.
+
+This file supports BOTH workflows from one class:
+
+  - The original Texas-Gulf notebooks (baseline / flexible / risk), which build
+    the designer from an UNSPLIT streamflow matrix:
+        SensorNetworkDesigner(streamflow_data=..., locations=..., location_labels=...)
+    and read result.performance_metrics and call result.plot_comparison(flowlines_gdf=...).
+
+  - The GloFAS notebook (design_glofas_brazil_v2), which builds it from data that
+    is ALREADY split, uses regional placement, reads result.eval_results, and lets
+    plot_comparison auto-detect a gridded background.
+
+Blocks added purely for backward compatibility with the original notebooks are
+marked with "# --- compat ---" so they are easy to find.
+"""
+
+import time
+from pathlib import Path
+from typing import Union, List, Optional, Dict
 
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-from pathlib import Path
-from typing import Union, List, Optional, Dict
-import warnings
 
-from .data import load_streamflow_data, prepare_gauge_locations, split_timeseries, prepare_matrix
-from .core import sensor_placement_qr, calculate_performance_metrics, reconstruction_evaluation
-from .spatial import calculate_spatial_weights
+import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+from matplotlib.colors import Normalize, TwoSlopeNorm
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+
+from hydrosensenet.data.loaders import load_streamflow_data, prepare_gauge_locations
+from hydrosensenet.data.preprocessors import split_timeseries, prepare_matrix
+from hydrosensenet.core.algorithms import sensor_placement_qr, qr_pivot_selection
+from hydrosensenet.core.metrics import reconstruction_evaluation
 
 
 class SensorNetworkDesigner:
-    """Easy-to-use interface for designing optimal sensor networks."""
+    """High-level API for designing a sensor network from streamflow data."""
 
     def __init__(
         self,
-        streamflow_data: np.ndarray,
-        locations: gpd.GeoDataFrame,
-        location_labels: Optional[List[str]] = None
+        streamflow_data: Optional[Union[np.ndarray, pd.DataFrame]] = None,
+        locations: gpd.GeoDataFrame = None,
+        location_labels: Optional[List[str]] = None,
+        train_frac: float = 0.7,
+        filter_invalid: bool = True,
+        *,
+        X_train: Optional[np.ndarray] = None,
+        X_test: Optional[np.ndarray] = None,
     ):
-        """Initialize sensor network designer."""
-        self.streamflow_data = streamflow_data
-        self.locations = locations
-        self.location_labels = location_labels or [str(i) for i in range(streamflow_data.shape[1])]
+        """
+        Two ways to provide data:
 
-        # Validate dimensions
-        if streamflow_data.shape[1] != len(locations):
-            raise ValueError(
-                f"Streamflow data has {streamflow_data.shape[1]} locations but "
-                f"locations GeoDataFrame has {len(locations)} rows"
+          - streamflow_data : an UNSPLIT matrix; it is split here using
+            train_frac (this is what the original Texas-Gulf notebooks use).
+          - X_train, X_test : data that is ALREADY split (the GloFAS workflow).
+
+        `locations` has one row per data column, in the same order as the
+        columns of X_train / X_test.
+        """
+        if X_train is not None and X_test is not None:
+            self.streamflow_data = None                       # already split
+        elif streamflow_data is not None:
+            # --- compat --- split here so the original notebooks can pass an
+            # unsplit matrix exactly as before.
+            X_train, X_test = split_timeseries(
+                streamflow_data, train_frac=train_frac, filter_invalid=filter_invalid
             )
+            if hasattr(X_train, "values"):
+                X_train, X_test = X_train.values, X_test.values
+            self.streamflow_data = streamflow_data            # baseline reads .shape on this
+        else:
+            raise ValueError("provide either streamflow_data or both X_train and X_test")
+
+        if X_train.shape[1] != X_test.shape[1]:
+            raise ValueError(
+                f"X_train has {X_train.shape[1]} columns, X_test has {X_test.shape[1]}"
+            )
+        if len(locations) != X_train.shape[1]:
+            raise ValueError(
+                f"locations has {len(locations)} rows but data has {X_train.shape[1]} columns"
+            )
+
+        self.X_train = X_train
+        self.X_test = X_test
+        self.locations = locations
+        self.location_labels = location_labels or [str(i) for i in range(X_train.shape[1])]
+
+    # ----- convenience constructors -----
+
+    @classmethod
+    def from_split(
+        cls,
+        X_train: np.ndarray,
+        X_test: np.ndarray,
+        locations: gpd.GeoDataFrame,
+        location_labels: Optional[List[str]] = None,
+    ) -> "SensorNetworkDesigner":
+        """Build from data that is already split (explicit alias for the GloFAS path)."""
+        return cls(X_train=X_train, X_test=X_test,
+                   locations=locations, location_labels=location_labels)
+
+    @classmethod
+    def from_streamflow(
+        cls,
+        streamflow_data: Union[np.ndarray, pd.DataFrame],
+        locations: gpd.GeoDataFrame,
+        train_frac: float = 0.7,
+        filter_invalid: bool = True,
+        location_labels: Optional[List[str]] = None,
+    ) -> "SensorNetworkDesigner":
+        """Build a designer from an unsplit streamflow matrix."""
+        return cls(streamflow_data=streamflow_data, locations=locations,
+                   location_labels=location_labels,
+                   train_frac=train_frac, filter_invalid=filter_invalid)
 
     @classmethod
     def from_files(
         cls,
-        streamflow_file: Union[str, Path, List[Union[str, Path]]],
-        locations_file: Optional[Union[str, Path]] = None,
+        streamflow_file: Union[str, Path, List],
+        locations_file: Union[str, Path],
         time_col: Optional[str] = None,
-        lat_col: str = "latitude",
-        lon_col: str = "longitude",
-        **streamflow_kwargs
-    ):
-        """Create designer from data files (CSV, Parquet, Excel, NetCDF, etc.)."""
-        # Load streamflow data
-        streamflow = load_streamflow_data(
-            streamflow_file,
-            time_col=time_col,
-            **streamflow_kwargs
-        )
+        train_frac: float = 0.7,
+        **kwargs,
+    ) -> "SensorNetworkDesigner":
+        """Build a designer from streamflow + gauge-location files."""
+        streamflow = load_streamflow_data(streamflow_file, time_col=time_col, **kwargs)
+        locations = prepare_gauge_locations(locations_file)
 
-        # Load locations
-        locations = prepare_gauge_locations(
-            locations_file,
-            lat_col=lat_col,
-            lon_col=lon_col
-        )
-
-        # Convert to matrix if needed
         if isinstance(streamflow, pd.DataFrame):
-            matrix = streamflow.values
-            labels = list(streamflow.columns)
+            matrix, labels = streamflow.values, list(streamflow.columns)
         else:
             matrix, labels = prepare_matrix(streamflow)
 
-        return cls(matrix, locations, labels)
-
-    @classmethod
-    def from_csv(
-        cls,
-        streamflow_file: Union[str, Path, List[Union[str, Path]]],
-        locations_file: Optional[Union[str, Path]] = None,
-        time_col: Optional[str] = None,
-        lat_col: str = "latitude",
-        lon_col: str = "longitude"
-    ):
-        """Load data from files (works with all formats despite name)."""
-        return cls.from_files(
-            streamflow_file=streamflow_file,
-            locations_file=locations_file,
-            time_col=time_col,
-            lat_col=lat_col,
-            lon_col=lon_col
-        )
+        return cls(streamflow_data=matrix, locations=locations,
+                   location_labels=labels, train_frac=train_frac)
 
     @classmethod
     def from_nwm_download(
         cls,
         streamflow_file: Union[str, Path],
         locations_geojson: Union[str, Path],
-        id_col: str = "comid"
-    ):
-        """Convenience method for NWM downloads with auto-alignment."""
-        import geopandas as gpd
+        id_col: str = "comid",
+        train_frac: float = 0.7,
+    ) -> "SensorNetworkDesigner":
+        """
+        Build from an NWM-style streamflow DataFrame (COMID columns) plus a
+        GeoJSON with flowline geometries.
 
-        # Load streamflow data (auto-detects 'time' column now)
+        Original LineString geometries are preserved on `self.locations`
+        (used by plot_comparison for reach-based visuals). Centroid
+        latitude/longitude columns are added for convenience.
+        """
         streamflow = load_streamflow_data(streamflow_file)
+        if not isinstance(streamflow, pd.DataFrame):
+            raise ValueError("expected a DataFrame from streamflow_file")
 
-        # Get COMID columns from streamflow
-        if isinstance(streamflow, pd.DataFrame):
-            comids_streamflow = set([int(col) for col in streamflow.columns])
-        else:
-            raise ValueError("Expected DataFrame from streamflow file")
+        streamflow_comids = {int(c) for c in streamflow.columns}
 
-        # Load locations GeoJSON
-        locations_gdf = gpd.read_file(locations_geojson)
+        # Keep LineString geometry, add centroid columns alongside
+        locations = gpd.read_file(locations_geojson)
+        locations = locations[locations[id_col].isin(streamflow_comids)].copy()
+        locations = locations.sort_values(id_col).reset_index(drop=True)
 
-        # Filter to only COMIDs that exist in streamflow data
-        locations_filtered = locations_gdf[
-            locations_gdf[id_col].isin(comids_streamflow)
-        ].copy()
+        centroids = locations.to_crs("EPSG:5070").geometry.centroid.to_crs("EPSG:4326")
+        locations["latitude"] = centroids.y.values
+        locations["longitude"] = centroids.x.values
 
-        # Calculate centroids for point locations
-        # Reproject to projected CRS for accurate centroids
-        locations_proj = locations_filtered.to_crs("EPSG:5070")  # USA Contiguous Albers Equal Area
-        centroids = locations_proj.geometry.centroid.to_crs("EPSG:4326")
+        # Align streamflow columns to (now sorted) location row order
+        comid_order = [str(c) for c in locations[id_col].values]
+        streamflow.columns = streamflow.columns.astype(str)
+        streamflow = streamflow[comid_order]
 
-        locations_filtered['longitude'] = centroids.x
-        locations_filtered['latitude'] = centroids.y
-        locations_filtered.geometry = centroids
+        return cls(streamflow_data=streamflow.values, locations=locations,
+                   location_labels=comid_order, train_frac=train_frac)
 
-        # Align streamflow columns with locations
-        # Sort both by COMID to ensure alignment
-        locations_filtered = locations_filtered.sort_values(id_col).reset_index(drop=True)
-        comid_order = [str(c) for c in locations_filtered[id_col].values]
-        streamflow_aligned = streamflow[comid_order]
-
-        # Create designer
-        matrix = streamflow_aligned.values
-        labels = comid_order
-
-        return cls(matrix, locations_filtered, labels)
+    # ----- main API -----
 
     def design_network(
         self,
-        n_sensors: int,
+        n_sensors: Optional[int] = None,
+        *,
         weights: Optional[Union[np.ndarray, str, Path]] = None,
-        weight_column: Optional[str] = None,
+        weight_column: Optional[str] = None,        # --- compat --- used only with file-path weights
         existing_sensors: Optional[List[int]] = None,
-        train_frac: float = 0.7,
+        region_column: Optional[str] = None,
+        sensors_per_region: Optional[Dict[str, int]] = None,
         evaluate: bool = True,
-        verbose: bool = True
-    ) -> 'NetworkDesignResult':
-        """Design optimal sensor network."""
-        import time
+        verbose: bool = True,
+    ) -> "NetworkDesignResult":
+        """
+        Design an optimal sensor network.
 
-        if verbose:
-            print(f"\n{'='*70}")
-            print(f"SENSOR NETWORK DESIGN")
-            print(f"{'='*70}")
-            print(f"Input data: {self.streamflow_data.shape[0]:,} timesteps × {self.streamflow_data.shape[1]:,} locations")
-            print(f"Target sensors: {n_sensors}")
-            print(f"Evaluation: {'Enabled' if evaluate else 'Disabled'}")
+        Three modes (mutually exclusive):
+          - existing_sensors with len == n_sensors : skip QR, just evaluate.
+          - region_column + sensors_per_region     : regional QR.
+          - n_sensors                              : global QR.
 
-        # Process weights
+        weights : per-location importance weights (length n_loc), OR a file
+            path / column name pair (handled via calculate_spatial_weights).
+        existing_sensors with len < n_sensors are treated as fixed in QR.
+        """
+        use_regional = region_column is not None
+        if use_regional:
+            if sensors_per_region is None:
+                raise ValueError("sensors_per_region required with region_column")
+            if region_column not in self.locations.columns:
+                raise ValueError(f"'{region_column}' not in self.locations.columns")
+            if existing_sensors is not None:
+                raise ValueError("existing_sensors not supported with regional selection")
+            n_sensors = sum(sensors_per_region.values())
+        elif n_sensors is None:
+            raise ValueError("n_sensors required when region_column is not given")
+
+        # --- compat --- allow weights to be a file path + column (original feature).
+        if isinstance(weights, (str, Path)):
+            from hydrosensenet.spatial import calculate_spatial_weights
+            weights = calculate_spatial_weights(
+                self.locations, weights, weight_column=weight_column
+            )
         if weights is not None:
-            if verbose:
-                print(f"\n[1/4] Processing weights...")
-            if isinstance(weights, (str, Path)):
-                weight_array = calculate_spatial_weights(
-                    self.locations,
-                    weights,
-                    weight_column=weight_column
+            weights = np.asarray(weights)
+            if len(weights) != self.X_train.shape[1]:
+                raise ValueError(
+                    f"weights length {len(weights)} != n_locations {self.X_train.shape[1]}"
                 )
-            elif isinstance(weights, np.ndarray):
-                weight_array = weights
-            else:
-                raise TypeError("weights must be array or file path")
-            if verbose:
-                print(f"      ✓ Weights applied")
-        else:
-            weight_array = None
-
-        # Split data if evaluation requested
-        if evaluate:
-            if verbose:
-                print(f"\n[2/4] Splitting data (train: {train_frac:.0%}, test: {1-train_frac:.0%})...")
-            start_time = time.time()
-            X_train, X_test = split_timeseries(
-                self.streamflow_data,
-                train_frac=train_frac,
-                filter_invalid=True
-            )
-            if verbose:
-                print(f"      ✓ Train: {X_train.shape[0]:,} × {X_train.shape[1]:,}")
-                print(f"      ✓ Test:  {X_test.shape[0]:,} × {X_test.shape[1]:,}")
-                print(f"      Completed in {time.time() - start_time:.2f}s")
-        else:
-            X_train = self.streamflow_data
-            X_test = None
-
-        # Perform sensor placement (skip if all sensors are already specified)
-        if existing_sensors is not None and len(existing_sensors) == n_sensors:
-            # Skip QR - we're just evaluating existing sensors
-            if verbose:
-                print(f"\n[3/4] Using {n_sensors} existing sensor locations (skipping QR)...")
-            selected_indices = np.array(existing_sensors)
-        else:
-            # Run QR decomposition to find optimal locations
-            if verbose:
-                print(f"\n[3/4] Running QR decomposition for sensor placement...")
-                print(f"      Matrix size: {X_train.shape[0]:,} × {X_train.shape[1]:,}")
-                print(f"      This may take several minutes for large datasets...")
-                start_time = time.time()
-
-            selected_indices = sensor_placement_qr(
-                X_train,
-                n_sensors=n_sensors,
-                weights=weight_array,
-                fixed_indices=existing_sensors,
-                verbose=verbose
-            )
-
-            if verbose:
-                print(f"      ✓ QR decomposition completed in {time.time() - start_time:.2f}s")
-                print(f"      ✓ Selected {len(selected_indices)} sensor locations")
-
-        # Evaluate if requested
-        if evaluate and X_test is not None:
-            if verbose:
-                print(f"\n[4/4] Evaluating reconstruction performance...")
-                start_time = time.time()
-
-            eval_results = reconstruction_evaluation(
-                X_train, X_test, selected_indices, n_sensors, verbose=verbose
-            )
-
-            # Use pre-calculated NSE/NNSE from eval_results (avoids redundant computation)
-            nse = eval_results['nse']
-            nnse = eval_results['nnse']
-            r2 = None  # Skip R² calculation (same as NSE)
-
-            if verbose:
-                print(f"      ✓ Evaluation completed in {time.time() - start_time:.2f}s")
-                print(f"      Relative error: {eval_results['relative_error']:.4f}")
-        else:
-            eval_results = None
-            r2 = nse = nnse = None
-
-        # Create result object
-        result = NetworkDesignResult(
-            selected_indices=selected_indices,
-            locations=self.locations.iloc[selected_indices],
-            location_labels=[self.location_labels[i] for i in selected_indices],
-            performance_metrics={
-                'r2': r2,
-                'nse': nse,
-                'nnse': nnse,
-                'eval_results': eval_results
-            } if evaluate else None,
-            n_sensors=n_sensors,
-            weights=weight_array
-        )
 
         if verbose:
-            print(f"\n{'='*70}")
-            print(f"DESIGN COMPLETE")
-            print(f"{'='*70}\n")
+            mode = "regional" if use_regional else "global"
+            print(f"\nDesigning sensor network: {n_sensors} sensors, {mode} selection")
+            print(f"  Data: train {self.X_train.shape}, test {self.X_test.shape}")
 
-        return result
+        # ----- select -----
+        t0 = time.perf_counter()
+        if existing_sensors is not None and len(existing_sensors) == n_sensors:
+            if verbose:
+                print(f"  Using provided {n_sensors} sensors (skipping QR)")
+            selected_indices = np.asarray(existing_sensors)
+
+        elif use_regional:
+            region_assignments = pd.DataFrame({
+                region_column: self.locations[region_column].values,
+                "col_pos": np.arange(len(self.locations)),
+            })
+            _, selected_indices = qr_pivot_selection(
+                self.X_train, region_assignments, sensors_per_region,
+                region_column=region_column,
+            )
+
+        else:
+            selected_indices = sensor_placement_qr(
+                self.X_train, n_sensors=n_sensors,
+                weights=weights, fixed_indices=existing_sensors,
+                verbose=verbose,
+            )
+
+        if verbose:
+            print(f"  Selection done in {time.perf_counter() - t0:.1f}s "
+                  f"({len(selected_indices)} sensors)")
+
+        # ----- evaluate -----
+        eval_results = None
+        if evaluate:
+            t0 = time.perf_counter()
+            eval_results = reconstruction_evaluation(
+                self.X_train, self.X_test, selected_indices, n_sensors,
+                verbose=verbose,
+            )
+            if verbose:
+                print(f"  Evaluation done in {time.perf_counter() - t0:.1f}s "
+                      f"(relative error: {eval_results['relative_error']:.4f})")
+
+        return NetworkDesignResult(
+            selected_indices=selected_indices,
+            n_sensors=n_sensors,
+            locations=self.locations.iloc[selected_indices].copy(),
+            location_labels=[self.location_labels[i] for i in selected_indices],
+            eval_results=eval_results,
+            weights=weights,
+            region_column=region_column if use_regional else None,
+            sensors_per_region=sensors_per_region if use_regional else None,
+            all_locations=self.locations,
+        )
 
 
 class NetworkDesignResult:
-    """Results from sensor network design."""
+    """Results from a sensor network design run."""
 
     def __init__(
         self,
         selected_indices: np.ndarray,
+        n_sensors: int,
         locations: gpd.GeoDataFrame,
         location_labels: List[str],
-        performance_metrics: Optional[Dict],
-        n_sensors: int,
-        weights: Optional[np.ndarray]
+        eval_results: Optional[Dict],
+        weights: Optional[np.ndarray] = None,
+        region_column: Optional[str] = None,
+        sensors_per_region: Optional[Dict[str, int]] = None,
+        all_locations: Optional[gpd.GeoDataFrame] = None,
     ):
         self.selected_indices = selected_indices
+        self.n_sensors = n_sensors
         self.locations = locations
         self.location_labels = location_labels
-        self.performance_metrics = performance_metrics
-        self.n_sensors = n_sensors
+        self.eval_results = eval_results
         self.weights = weights
+        self.region_column = region_column
+        self.sensors_per_region = sensors_per_region
+        self.all_locations = all_locations
+
+        # --- compat --- the original notebooks read result.performance_metrics['nnse'].
+        # Expose the same dict shape the original produced (r2 is None, as it was).
+        self.performance_metrics = (
+            {
+                "r2": None,
+                "nse": eval_results["nse"],
+                "nnse": eval_results["nnse"],
+                "eval_results": eval_results,
+            }
+            if eval_results is not None else None
+        )
+
+    # ----- summary -----
 
     def print_summary(self):
-        """Print summary of results."""
-        print(f"\n{'='*60}")
-        print(f"SENSOR NETWORK DESIGN RESULTS")
-        print(f"{'='*60}")
-        print(f"Number of sensors selected: {self.n_sensors}")
-        print(f"Selected locations: {self.selected_indices[:10]}..." if len(self.selected_indices) > 10 else f"Selected locations: {self.selected_indices}")
+        """Print a short text summary."""
+        print("\nSensor network design")
+        print(f"  Sensors selected: {self.n_sensors}")
 
-        if self.performance_metrics:
-            print(f"\nPERFORMANCE METRICS:")
-            r2 = self.performance_metrics.get('r2')
-            nse = self.performance_metrics.get('nse')
-            nnse = self.performance_metrics.get('nnse')
+        if self.region_column and self.sensors_per_region:
+            print(f"  Regional allocation ({self.region_column}):")
+            for region, count in self.sensors_per_region.items():
+                print(f"    {region}: {count}")
 
-            if r2 is not None:
-                print(f"  Median R²: {np.nanmedian(r2):.3f}")
-            if nse is not None:
-                print(f"  Median NSE: {np.nanmedian(nse):.3f}")
-            if nnse is not None:
-                print(f"  Median NNSE: {np.nanmedian(nnse):.3f}")
+        preview = list(self.selected_indices[:10])
+        suffix = " ..." if len(self.selected_indices) > 10 else ""
+        print(f"  Indices: {preview}{suffix}")
 
-            eval_res = self.performance_metrics.get('eval_results')
-            if eval_res:
-                print(f"  Relative Error: {eval_res['relative_error']:.4f}")
+        if self.eval_results is not None:
+            nse  = self.eval_results["nse"]
+            nnse = self.eval_results["nnse"]
+            print("\n  Performance (median across locations):")
+            print(f"    NSE:  {np.nanmedian(nse):.3f}")
+            print(f"    NNSE: {np.nanmedian(nnse):.3f}")
+            print(f"    Relative error: {self.eval_results['relative_error']:.4f}")
 
-        print(f"{'='*60}\n")
+    # ----- export -----
+
+    def get_dataframe(self) -> pd.DataFrame:
+        """Return a flat DataFrame with selected sensors + metrics."""
+        df = self.locations.drop(columns="geometry").reset_index(drop=True)
+
+        # Ensure latitude/longitude columns (derive from geometry if missing)
+        if "latitude" not in df.columns or "longitude" not in df.columns:
+            lats, lons = self._point_coords(self.locations)
+            df["latitude"], df["longitude"] = lats, lons
+
+        df.insert(0, "sensor_rank", np.arange(1, len(df) + 1))
+        df["location_index"] = self.selected_indices
+        df["location_label"] = self.location_labels
+
+        if self.eval_results is not None:
+            df["nse"]  = self.eval_results["nse"][self.selected_indices]
+            df["nnse"] = self.eval_results["nnse"][self.selected_indices]
+            df["rmse"] = self.eval_results["rmse"][self.selected_indices]
+        return df
 
     def export(
         self,
         output_path: Union[str, Path],
         format: str = "auto",
-        include_metrics: bool = True
+        include_metrics: bool = True,
     ):
-        """Export results to file."""
+        """Save results to CSV / shapefile / GeoJSON / GeoPackage / Excel."""
         output_path = Path(output_path)
-
-        # Auto-detect format
         if format == "auto":
-            suffix = output_path.suffix.lower()
-            format_map = {
-                '.csv': 'csv',
-                '.shp': 'shapefile',
-                '.geojson': 'geojson',
-                '.gpkg': 'geopackage',
-                '.xlsx': 'excel'
-            }
-            format = format_map.get(suffix, 'csv')
+            format = {
+                ".csv": "csv", ".shp": "shp", ".geojson": "geojson",
+                ".gpkg": "gpkg", ".xlsx": "xlsx",
+            }.get(output_path.suffix.lower(), "csv")
 
-        # Prepare output data
-        output_data = self.locations.copy()
-        output_data['sensor_rank'] = range(1, len(output_data) + 1)
-
-        if include_metrics and self.performance_metrics:
-            r2 = self.performance_metrics.get('r2')
-            nse = self.performance_metrics.get('nse')
-            nnse = self.performance_metrics.get('nnse')
-            if r2 is not None:
-                output_data['r2'] = r2[self.selected_indices]
-            if nse is not None:
-                output_data['nse'] = nse[self.selected_indices]
-            if nnse is not None:
-                output_data['nnse'] = nnse[self.selected_indices]
-
-        # Export based on format
-        if format == "csv":
-            # Convert to regular DataFrame for CSV
-            df = pd.DataFrame(output_data.drop(columns='geometry'))
-            # Convert to centroids if geometries are not Points
-            if output_data.geometry.geom_type.iloc[0] != 'Point':
-                output_proj = output_data.to_crs("EPSG:5070")
-                centroids = output_proj.geometry.centroid.to_crs(output_data.crs)
-                df['longitude'] = centroids.x
-                df['latitude'] = centroids.y
-            else:
-                df['longitude'] = output_data.geometry.x
-                df['latitude'] = output_data.geometry.y
-            df.to_csv(output_path, index=False)
-        elif format in ["shapefile", "shp"]:
-            output_data.to_file(output_path, driver="ESRI Shapefile")
-        elif format == "geojson":
-            output_data.to_file(output_path, driver="GeoJSON")
-        elif format in ["geopackage", "gpkg"]:
-            output_data.to_file(output_path, driver="GPKG")
-        elif format == "excel":
-            df = pd.DataFrame(output_data.drop(columns='geometry'))
-            # Convert to centroids if geometries are not Points
-            if output_data.geometry.geom_type.iloc[0] != 'Point':
-                output_proj = output_data.to_crs("EPSG:5070")
-                centroids = output_proj.geometry.centroid.to_crs(output_data.crs)
-                df['longitude'] = centroids.x
-                df['latitude'] = centroids.y
-            else:
-                df['longitude'] = output_data.geometry.x
-                df['latitude'] = output_data.geometry.y
-            df.to_excel(output_path, index=False)
+        if format in ("csv", "xlsx"):
+            df = self.get_dataframe()
+            (df.to_excel if format == "xlsx" else df.to_csv)(output_path, index=False)
         else:
-            raise ValueError(f"Unsupported format: {format}")
+            # Geometry-aware formats: keep the GeoDataFrame, attach metrics inline
+            gdf = self.locations.copy()
+            gdf["sensor_rank"] = np.arange(1, len(gdf) + 1)
+            if include_metrics and self.eval_results is not None:
+                gdf["nse"]  = self.eval_results["nse"][self.selected_indices]
+                gdf["nnse"] = self.eval_results["nnse"][self.selected_indices]
+                gdf["rmse"] = self.eval_results["rmse"][self.selected_indices]
+            driver = {"shp": "ESRI Shapefile", "geojson": "GeoJSON", "gpkg": "GPKG"}[format]
+            gdf.to_file(output_path, driver=driver)
 
         print(f"Results exported to: {output_path}")
 
-    def get_dataframe(self) -> pd.DataFrame:
-        """
-        Get results as DataFrame.
+    # ----- helpers (also used by plot_*) -----
 
-        Returns
-        -------
-        pd.DataFrame
-            Selected sensors with coordinates and metrics.
-        """
-        # Convert to centroids if geometries are not Points
-        if self.locations.geometry.geom_type.iloc[0] != 'Point':
-            locations_proj = self.locations.to_crs("EPSG:5070")
-            centroids = locations_proj.geometry.centroid.to_crs(self.locations.crs)
-            lons = centroids.x
-            lats = centroids.y
-        else:
-            lons = self.locations.geometry.x
-            lats = self.locations.geometry.y
+    @staticmethod
+    def _point_coords(gdf: gpd.GeoDataFrame):
+        """Return (lats, lons). Uses centroids for non-Point geometries."""
+        if gdf.geometry.geom_type.iloc[0] == "Point":
+            return gdf.geometry.y.to_numpy(), gdf.geometry.x.to_numpy()
+        # Centroids in an equal-area projection for accuracy, then back
+        centroids = gdf.to_crs("EPSG:5070").geometry.centroid.to_crs(gdf.crs)
+        return centroids.y.to_numpy(), centroids.x.to_numpy()
 
-        df = pd.DataFrame({
-            'sensor_rank': range(1, len(self.selected_indices) + 1),
-            'location_index': self.selected_indices,
-            'location_label': self.location_labels,
-            'longitude': lons,
-            'latitude': lats
-        })
+    # ----- plotting -----
 
-        if self.performance_metrics:
-            r2 = self.performance_metrics.get('r2')
-            nse = self.performance_metrics.get('nse')
-            nnse = self.performance_metrics.get('nnse')
-            if r2 is not None:
-                df['r2'] = r2[self.selected_indices]
-            if nse is not None:
-                df['nse'] = nse[self.selected_indices]
-            if nnse is not None:
-                df['nnse'] = nnse[self.selected_indices]
-
-        return df
-
-    def plot(
+    def plot_sensors(
         self,
-        figsize=(12, 8),
-        show_rank=True,
-        basemap=True,
-        title="Optimal Sensor Network Design",
-        save_path=None,
-        flowlines_gdf=None,
-        rank_column='Median Rank'
+        save_path: Optional[str] = None,
+        figsize: tuple = (8, 6),
+        dpi: int = 200,
+        color: str = "green",
+        label: Optional[str] = None,
     ):
-        """Create map visualization of selected sensors."""
-        import matplotlib.pyplot as plt
-        import cartopy.crs as ccrs
-        import cartopy.feature as cfeature
-        from matplotlib.collections import LineCollection
-        from matplotlib.colors import Normalize
+        """Simple map showing selected sensor locations."""
+        fig, ax = self._setup_axes(figsize, dpi)
+        lats, lons = self._point_coords(self.locations)
+        ax.set_extent(self._calculate_extent(lons, lats), crs=ccrs.PlateCarree())
 
-        # Use Lambert Conformal projection if flowlines provided, otherwise PlateCarree
-        if flowlines_gdf is not None:
-            proj = ccrs.LambertConformal(
-                central_latitude=33,
-                central_longitude=-96,
-                standard_parallels=(33.0, 45.0)
-            )
-        else:
-            proj = ccrs.PlateCarree()
-
-        # Create figure with geographic projection
-        fig, ax = plt.subplots(
-            figsize=figsize,
-            dpi=600,
-            subplot_kw={'projection': proj}
+        ax.scatter(
+            lons, lats,
+            color=color, edgecolors="white", linewidth=0.5, s=15,
+            label=label or f"Selected sensors (n={len(lats)})",
+            transform=ccrs.PlateCarree(),
         )
+        self._add_map_features(ax)
+        ax.legend(loc="upper right", frameon=True, fontsize=9, framealpha=0.9)
+        plt.tight_layout()
 
-        # Configure axis
-        if flowlines_gdf is not None:
-            ax.set_extent([-106.65, -93.0, 25.0, 36.5], crs=ccrs.PlateCarree())
-            ax.spines['geo'].set_visible(False)
-        else:
-            # Set extent based on sensor locations
-            # Convert to centroids if geometries are not Points
-            if self.locations.geometry.geom_type.iloc[0] != 'Point':
-                locations_proj = self.locations.to_crs("EPSG:5070")
-                centroids = locations_proj.geometry.centroid.to_crs(self.locations.crs)
-                lons = centroids.x
-                lats = centroids.y
-            else:
-                lons = self.locations.geometry.x
-                lats = self.locations.geometry.y
-            margin = 0.5
-            ax.set_extent([
-                lons.min() - margin, lons.max() + margin,
-                lats.min() - margin, lats.max() + margin
-            ])
-
-        # Plot flowlines if provided
-        if flowlines_gdf is not None:
-            # Project flowlines to map projection
-            flowlines_proj = flowlines_gdf.to_crs(proj.proj4_params)
-
-            # First layer: thin black outline for contrast
-            lines_outline = LineCollection(
-                [np.array(geometry.xy).T for geometry in flowlines_proj.geometry],
-                linewidths=0.025,
-                alpha=0.8,
-                color='black',
-                zorder=1
-            )
-            ax.add_collection(lines_outline)
-
-            # Second layer: colored lines by rank
-            lines = LineCollection(
-                [np.array(geometry.xy).T for geometry in flowlines_proj.geometry],
-                linewidths=1,
-                alpha=1,
-                zorder=1
-            )
-            lines.set_array(flowlines_proj[rank_column])
-            lines.set_cmap('viridis_r')
-            ax.add_collection(lines)
-
-            # Add colorbar for flowlines
-            cb_ax = fig.add_axes([0.85, 0.2, 0.02, 0.6])
-            cb = fig.colorbar(lines, cax=cb_ax, orientation='vertical', label='Sensor Rank')
-
-            # Add legend (matches original even though no labeled elements)
-            ax.legend(frameon=False, loc='best')
-
-            plt.subplots_adjust(left=0.05, right=0.8, top=0.95, bottom=0.1)
-        else:
-            # Original scatter plot for sensors
-            # Convert to centroids if geometries are not Points
-            if self.locations.geometry.geom_type.iloc[0] != 'Point':
-                locations_proj = self.locations.to_crs("EPSG:5070")
-                centroids = locations_proj.geometry.centroid.to_crs(self.locations.crs)
-                lons = centroids.x
-                lats = centroids.y
-            else:
-                lons = self.locations.geometry.x
-                lats = self.locations.geometry.y
-
-            # Color by rank (lower rank = more important)
-            scatter = ax.scatter(
-                lons, lats,
-                c=range(1, len(lons) + 1),
-                cmap='RdYlGn_r',
-                s=100,
-                edgecolor='black',
-                linewidth=0.5,
-                alpha=0.8,
-                transform=ccrs.PlateCarree(),
-                zorder=5
-            )
-
-            # Add rank numbers if requested
-            if show_rank and len(lons) <= 50:
-                for i, (lon, lat) in enumerate(zip(lons, lats)):
-                    ax.text(
-                        lon, lat, str(i+1),
-                        fontsize=6,
-                        ha='center', va='center',
-                        color='white',
-                        weight='bold',
-                        transform=ccrs.PlateCarree(),
-                        zorder=6
-                    )
-
-            # Add colorbar for sensors
-            cbar = plt.colorbar(scatter, ax=ax, pad=0.02, shrink=0.8)
-            cbar.set_label('Sensor Rank (1 = highest priority)', rotation=270, labelpad=15)
-
-            # Add gridlines
-            gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.3)
-            gl.top_labels = False
-            gl.right_labels = False
-
-            plt.tight_layout()
-
-        # Add basemap features
-        if basemap:
-            ax.add_feature(cfeature.BORDERS, linestyle='-', alpha=.2)
-            ax.add_feature(cfeature.STATES, linestyle=':', alpha=.2)
-
-        # Add title
-        if title:
-            ax.set_title(title, fontsize=14, weight='bold', pad=10)
-
-        # Add performance metrics if available (only for scatter plot mode)
-        if flowlines_gdf is None and self.performance_metrics:
-            r2 = self.performance_metrics.get('r2')
-            nse = self.performance_metrics.get('nse')
-            text_parts = []
-            if r2 is not None:
-                text_parts.append(f"Mean R²: {np.nanmean(r2):.3f}")
-            if nse is not None:
-                text_parts.append(f"Mean NSE: {np.nanmean(nse):.3f}")
-            if text_parts:
-                ax.text(
-                    0.02, 0.98, '\n'.join(text_parts),
-                    transform=ax.transAxes,
-                    fontsize=10,
-                    verticalalignment='top',
-                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8)
-                )
-
-        # Save if requested
         if save_path:
-            plt.savefig(save_path, bbox_inches='tight', dpi=600)
+            plt.savefig(save_path, bbox_inches="tight", dpi=dpi, transparent=True)
             print(f"Figure saved to: {save_path}")
-
         return fig, ax
 
     def plot_comparison(
         self,
-        baseline_result: 'NetworkDesignResult',
-        flowlines_gdf: gpd.GeoDataFrame,
-        location_labels: List[str],
+        baseline_result: "NetworkDesignResult",
+        metric: str = "nnse",
+        network_type: str = "auto",
+        save_path: Optional[str] = None,
+        figsize: tuple = (8, 6),
+        dpi: int = 200,
+        metric_range: tuple = (-0.5, 0.5),
+        # --- compat --- accepted so the original notebooks' calls don't error.
+        # flowlines_gdf can also supply the reach geometry if it isn't already
+        # carried on self.all_locations.
+        flowlines_gdf: Optional[gpd.GeoDataFrame] = None,
+        location_labels: Optional[List[str]] = None,
         comparison_labels: Optional[Dict[str, str]] = None,
-        metric: str = 'nnse',
-        figsize=(7, 5),
-        save_path=None,
-        comid_column: Optional[str] = None
+        comid_column: Optional[str] = None,
     ):
         """
-        Plot comparison of NNSE between this network and a baseline network.
+        Plot this design against a baseline, with a metric-difference background.
 
-        Parameters
-        ----------
-        baseline_result : NetworkDesignResult
-            Baseline network to compare against (e.g., USGS network)
-        flowlines_gdf : GeoDataFrame
-            GeoDataFrame containing flowline geometries with COMID column
-        location_labels : List[str]
-            Labels for all locations (COMIDs) matching the order in performance metrics
-        comparison_labels : dict, optional
-            Dictionary with keys 'optimal' and 'baseline' for scatter plot labels
-        metric : str
-            Performance metric to compare ('nnse', 'nse', or 'r2')
-        figsize : tuple
-            Figure size (width, height)
-        save_path : str, optional
-            Path to save the figure
-        comid_column : str, optional
-            Name of the COMID column in flowlines_gdf. If None, will auto-detect
-            by trying 'COMID', 'comid', 'feature_id', 'FEATUREID'
-
-        Returns
-        -------
-        tuple
-            (figure, axis)
+        network_type
+        ------------
+        'grid'    : pcolormesh of (this - baseline) — for gridded data (GloFAS)
+        'reaches' : colored flowlines of the same — for stream-reach data (USGS/NWM)
+        'points'  : no background, just sensor markers — for scattered points
+        'auto'    : LineString geometries -> reaches;
+                    Point on a uniform lat/lon grid -> grid;
+                    otherwise -> points
         """
-        import matplotlib.pyplot as plt
-        import cartopy.crs as ccrs
-        import cartopy.feature as cfeature
-        from matplotlib.collections import LineCollection
-        from matplotlib.colors import Normalize
+        if self.eval_results is None or baseline_result.eval_results is None:
+            raise ValueError("both designs must have eval_results (evaluate=True)")
 
-        # Default labels
-        if comparison_labels is None:
-            comparison_labels = {
-                'optimal': 'Optimal sensors',
-                'baseline': 'Baseline sensors'
-            }
+        # --- compat --- fall back to a passed-in flowlines layer if needed.
+        background_gdf = self.all_locations if self.all_locations is not None else flowlines_gdf
+        if background_gdf is None:
+            raise ValueError("need self.all_locations or flowlines_gdf for the background")
 
-        # Get performance metrics
-        if not self.performance_metrics or not baseline_result.performance_metrics:
-            raise ValueError("Both results must have performance metrics for comparison")
+        diff = self.eval_results[metric] - baseline_result.eval_results[metric]
 
-        optimal_metric = self.performance_metrics.get(metric)
-        baseline_metric = baseline_result.performance_metrics.get(metric)
+        if network_type == "auto":
+            network_type = self._detect_network_type(background_gdf)
 
-        if optimal_metric is None or baseline_metric is None:
-            raise ValueError(f"Metric '{metric}' not available in both results")
+        fig, ax = self._setup_axes(figsize, dpi)
 
-        # Calculate difference (optimal - baseline)
-        diff_metric = optimal_metric - baseline_metric
-
-        # Auto-detect COMID column if not specified
-        flowlines_gdf = flowlines_gdf.copy()
-        if comid_column is None:
-            # Try common COMID column names
-            for candidate in ['COMID', 'comid', 'feature_id', 'FEATUREID']:
-                if candidate in flowlines_gdf.columns:
-                    comid_column = candidate
-                    break
-            if comid_column is None:
-                raise ValueError(
-                    f"Could not find COMID column in flowlines_gdf. "
-                    f"Available columns: {list(flowlines_gdf.columns)}. "
-                    f"Please specify comid_column parameter."
-                )
-
-        # Create DataFrame with COMID and difference
-        diff_df = pd.DataFrame({
-            'COMID': location_labels,
-            'diff': diff_metric
-        })
-
-        # Merge with flowlines
-        flowlines_gdf['COMID'] = flowlines_gdf[comid_column].astype(str)
-        diff_df['COMID'] = diff_df['COMID'].astype(str)
-        flowlines_with_diff = flowlines_gdf.merge(diff_df, on='COMID', how='left')
-
-        # Setup projection
-        proj = ccrs.LambertConformal(
-            central_latitude=33,
-            central_longitude=-96,
-            standard_parallels=(33.0, 45.0)
+        # Extent from both sensor sets
+        opt_lats,  opt_lons  = self._point_coords(self.locations)
+        base_lats, base_lons = self._point_coords(baseline_result.locations)
+        ax.set_extent(
+            self._calculate_extent(
+                np.concatenate([opt_lons, base_lons]),
+                np.concatenate([opt_lats, base_lats]),
+            ),
+            crs=ccrs.PlateCarree(),
         )
 
-        # Project flowlines
-        flowlines_proj = flowlines_with_diff.to_crs(proj.proj4_params)
+        # Background (or none)
+        artist = None
+        if network_type == "grid":
+            artist = self._draw_grid_background(ax, background_gdf, diff, metric_range)
+        elif network_type == "reaches":
+            artist = self._draw_reach_background(ax, background_gdf, diff, metric_range)
 
-        # Create figure
-        fig, ax = plt.subplots(
-            figsize=figsize,
-            dpi=600,
-            subplot_kw={'projection': proj}
-        )
-        ax.set_extent([-106.65, -93.0, 25.0, 36.5], crs=ccrs.PlateCarree())
-        ax.spines['geo'].set_visible(False)
+        if artist is not None:
+            cbar = plt.colorbar(artist, ax=ax, fraction=0.04, pad=0.02)
+            cbar.set_label(f"Δ {metric.upper()}")
 
-        # Plot flowlines with difference colors
-        lines = LineCollection(
-            [np.array(geometry.xy).T for geometry in flowlines_proj.geometry],
-            linewidths=1,
-            alpha=1,
-            zorder=1
-        )
-        norm = Normalize(vmin=-1, vmax=1)
-        lines.set_array(flowlines_proj['diff'])
-        lines.set_cmap('bwr_r')
-        lines.set_norm(norm)
-        ax.add_collection(lines)
+        # Sensor overlays (honor comparison_labels if the original notebooks passed them)
+        labels = comparison_labels or {}
+        opt_label  = labels.get("optimal", "Reconfigured sensors")
+        base_label = labels.get("baseline", f"Baseline (n={len(base_lats)})")
+        ax.scatter(opt_lons,  opt_lats,
+                   color="green", edgecolors="white", linewidth=0.1,
+                   alpha=0.8, s=7, label=opt_label,
+                   transform=ccrs.PlateCarree())
+        ax.scatter(base_lons, base_lats,
+                   color="k", edgecolors="white", linewidth=0.1,
+                   alpha=0.8, s=7, label=base_label,
+                   transform=ccrs.PlateCarree())
 
-        # Add colorbar
-        cb_ax = fig.add_axes([0.85, 0.2, 0.02, 0.6])
-        metric_label = metric.upper() if metric != 'r2' else 'R²'
-        cb = fig.colorbar(
-            lines,
-            cax=cb_ax,
-            orientation='vertical',
-            label=f'Δ{metric_label}'
-        )
+        self._add_map_features(ax)
+        ax.legend(loc="upper right", frameon=True, fontsize=9, framealpha=0.9)
+        plt.tight_layout()
 
-        # Prepare sensor centroids for both networks
-        def get_centroids(result):
-            if result.locations.geometry.geom_type.iloc[0] != 'Point':
-                locs_proj = result.locations.to_crs("EPSG:5070")
-                centroids = locs_proj.geometry.centroid.to_crs("EPSG:4326")
-                centroids_gdf = gpd.GeoDataFrame(geometry=centroids, crs="EPSG:4326")
-            else:
-                centroids_gdf = result.locations.to_crs("EPSG:4326")
-            return centroids_gdf.to_crs(proj.proj4_params)
-
-        optimal_centroids = get_centroids(self)
-        baseline_centroids = get_centroids(baseline_result)
-
-        # Plot sensors
-        ax.scatter(
-            baseline_centroids.geometry.x,
-            baseline_centroids.geometry.y,
-            color='k',
-            edgecolor='white',
-            linewidths=0.6,
-            alpha=0.8,
-            s=7,
-            label=comparison_labels['baseline'],
-            zorder=5
-        )
-
-        ax.scatter(
-            optimal_centroids.geometry.x,
-            optimal_centroids.geometry.y,
-            color='green',
-            edgecolor='white',
-            linewidths=0.6,
-            alpha=0.8,
-            s=7,
-            label=comparison_labels['optimal'],
-            zorder=5
-        )
-
-        # Add map features and legend
-        ax.add_feature(cfeature.BORDERS, linestyle='-', alpha=.2)
-        ax.add_feature(cfeature.STATES, linestyle=':', alpha=.2)
-        ax.legend(frameon=False, loc='best')
-
-        plt.subplots_adjust(left=0.05, right=0.8, top=0.95, bottom=0.1)
-
-        # Save if requested
         if save_path:
-            plt.savefig(save_path, bbox_inches='tight', dpi=600)
+            plt.savefig(save_path, bbox_inches="tight", dpi=dpi, transparent=True)
             print(f"Figure saved to: {save_path}")
-
         return fig, ax
+
+    # ----- plotting helpers -----
+
+    def _detect_network_type(self, gdf: gpd.GeoDataFrame) -> str:
+        """Pick between 'grid', 'reaches', 'points' from geometry."""
+        geom_type = gdf.geometry.geom_type.iloc[0]
+        if geom_type in ("LineString", "MultiLineString"):
+            return "reaches"
+        if geom_type == "Point":
+            return "grid" if self._is_regular_grid(gdf) else "points"
+        return "points"
+
+    @staticmethod
+    def _is_regular_grid(gdf: gpd.GeoDataFrame, tol: float = 0.1) -> bool:
+        """Are these Points on a roughly uniform lat/lon grid?"""
+        if gdf.geometry.geom_type.iloc[0] != "Point":
+            return False
+        u_lats = np.unique(gdf.geometry.y.to_numpy())
+        u_lons = np.unique(gdf.geometry.x.to_numpy())
+        if len(u_lats) < 2 or len(u_lons) < 2:
+            return False
+        lat_d, lon_d = np.diff(u_lats), np.diff(u_lons)
+        cv_lat = lat_d.std() / lat_d.mean() if lat_d.mean() > 0 else np.inf
+        cv_lon = lon_d.std() / lon_d.mean() if lon_d.mean() > 0 else np.inf
+        return cv_lat < tol and cv_lon < tol
+
+    def _draw_grid_background(self, ax, gdf: gpd.GeoDataFrame, diff: np.ndarray, metric_range: tuple):
+        """pcolormesh for gridded data. Missing cells stay transparent (NaN)."""
+        lons = gdf.geometry.x.to_numpy()
+        lats = gdf.geometry.y.to_numpy()
+        u_lons = np.sort(np.unique(lons))
+        u_lats = np.sort(np.unique(lats))
+
+        Z = np.full((len(u_lats), len(u_lons)), np.nan)
+        Z[np.searchsorted(u_lats, lats), np.searchsorted(u_lons, lons)] = diff
+
+        norm = TwoSlopeNorm(vmin=metric_range[0], vcenter=0, vmax=metric_range[1])
+        return ax.pcolormesh(
+            u_lons, u_lats, Z,
+            cmap="bwr_r", norm=norm, shading="auto", alpha=0.8,
+            transform=ccrs.PlateCarree(),
+        )
+
+    def _draw_reach_background(self, ax, gdf: gpd.GeoDataFrame, diff: np.ndarray, metric_range: tuple):
+        """LineCollection for reach-based data."""
+        segments, values = [], []
+        for geom, d in zip(gdf.geometry, diff):
+            if geom.geom_type == "LineString":
+                segments.append(np.array(geom.coords))
+                values.append(d)
+            elif geom.geom_type == "MultiLineString":
+                # Split into individual parts, replicating the metric value
+                for part in geom.geoms:
+                    segments.append(np.array(part.coords))
+                    values.append(d)
+
+        lines = LineCollection(segments, linewidths=1.0, alpha=0.8, zorder=1,
+                               transform=ccrs.PlateCarree())
+        lines.set_array(np.asarray(values))
+        lines.set_cmap("bwr_r")
+        lines.set_norm(Normalize(vmin=metric_range[0], vmax=metric_range[1]))
+        ax.add_collection(lines)
+        return lines
+
+    @staticmethod
+    def _setup_axes(figsize, dpi):
+        fig = plt.figure(figsize=figsize, dpi=dpi)
+        ax = plt.axes(projection=ccrs.PlateCarree())
+        return fig, ax
+
+    @staticmethod
+    def _add_map_features(ax):
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.6)
+        ax.add_feature(cfeature.BORDERS, linewidth=0.5, linestyle=":")
+        gl = ax.gridlines(draw_labels=True, linewidth=0.4, color="gray",
+                          alpha=0.3, linestyle="--")
+        ax.add_feature(cfeature.STATES, linewidth=0.4, linestyle=':', alpha=0.5)
+        gl.top_labels = False
+        gl.right_labels = False
+
+    @staticmethod
+    def _calculate_extent(lons, lats, padding=0.05):
+        lon_range = lons.max() - lons.min()
+        lat_range = lats.max() - lats.min()
+        return [
+            lons.min() - lon_range * padding,
+            lons.max() + lon_range * padding,
+            lats.min() - lat_range * padding,
+            lats.max() + lat_range * padding,
+        ]
