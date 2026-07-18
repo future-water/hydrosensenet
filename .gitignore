@@ -150,3 +150,8 @@ Thumbs.db
 *.png
 *.txt
 *.gdb
+
+# ...but keep documentation images and the bundled example dataset
+!docs/_static/*.png
+!example_data/*.parquet
+!example_data/*.geojson

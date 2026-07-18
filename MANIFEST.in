@@ -1,0 +1,8 @@
+# Keep the source distribution lean: example notebooks and downloaded
+# data stay on GitHub, not in the PyPI sdist.
+exclude *.ipynb
+exclude .gitignore
+prune cache
+prune data
+prune docs
+prune example_data
