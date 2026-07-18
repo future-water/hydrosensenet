@@ -1,5 +1,6 @@
 """Spatial weighting for risk-informed sensor placement."""
 
+import warnings
 from pathlib import Path
 from typing import Iterable, Optional, Union
 
@@ -56,6 +57,12 @@ def calculate_spatial_weights(
         )
 
     else:
+        if locations_gdf.index.duplicated().any():
+            raise ValueError(
+                "locations_gdf has duplicated index labels; the spatial "
+                "join would silently merge weights across rows sharing a "
+                "label. Call locations_gdf.reset_index(drop=True) first."
+            )
         if isinstance(weight_source, (str, Path)):
             weight_gdf = gpd.read_file(weight_source)
         elif isinstance(weight_source, gpd.GeoDataFrame):
@@ -101,7 +108,21 @@ def calculate_spatial_weights(
     if align_to is not None:
         ids = _location_ids(locations_gdf, id_column)
         by_id = pd.Series(row_weights, index=ids).groupby(level=0).agg(aggregation)
-        weights = by_id.reindex(list(align_to)).to_numpy(dtype=float)
+        align_index = pd.Index(list(align_to))
+        n_missing = int((~align_index.isin(by_id.index)).sum())
+        if n_missing > 0:
+            message = (
+                f"{n_missing} of {len(align_index)} align_to ids not found "
+                f"in locations; filled with fill_value={fill_value}"
+            )
+            if n_missing == len(align_index):
+                message += (
+                    ". No ids matched at all; a dtype mismatch between "
+                    "align_to and the location ids (e.g. int vs str) is a "
+                    "likely cause."
+                )
+            warnings.warn(message)
+        weights = by_id.reindex(align_index).to_numpy(dtype=float)
     else:
         weights = row_weights
 

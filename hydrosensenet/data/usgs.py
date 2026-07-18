@@ -334,10 +334,12 @@ def match_usgs_to_nwm(
 
     Returns
     -------
-    tuple
-        (usgs_comids, matched_usgs_gdf)
-        - usgs_comids: List of COMIDs for USGS gauges
-        - matched_usgs_gdf: GeoDataFrame of matched USGS gauges
+    usgs_comids : list of int
+        COMIDs aligned to ``matched_usgs_gdf`` rows: ``usgs_comids[i]``
+        is the COMID of ``matched_usgs_gdf.iloc[i]``.
+    matched_usgs_gdf : GeoDataFrame
+        Matched USGS gauges with a ``comid`` column (one row per
+        station; duplicate stations dropped with a warning).
     """
     if len(comid_linkage) == 0:
         if verbose:
@@ -353,8 +355,6 @@ def match_usgs_to_nwm(
             print("Warning: No USGS gauges match available COMIDs")
         return [], gpd.GeoDataFrame()
 
-    # Get matched USGS stations
-    matched_stations = comid_linkage['STAID'].astype(str).values  # Ensure string type
     # Find station column in the GeoDataFrame
     station_col = None
     for col in ['STAID', 'SITE_NO', 'GAGE_ID', 'Gage_no']:
@@ -366,11 +366,43 @@ def match_usgs_to_nwm(
             print(f"Warning: Could not find station ID column in GeoDataFrame")
             print(f"  Available columns: {list(usgs_gdf.columns[:10])}...")
         return [], gpd.GeoDataFrame()
-    # Ensure both sides are strings for comparison
-    matched_usgs_gdf = usgs_gdf[usgs_gdf[station_col].astype(str).isin(matched_stations)].copy()
 
-    # Get COMIDs in order
-    usgs_comids = comid_linkage['COMID'].tolist()
+    # Merge the linkage into the gauge GeoDataFrame on the station id so
+    # COMIDs stay aligned with gauge rows. Compare station ids as strings
+    # on both sides (shapefiles may store them as int, dropping zeros).
+    gdf = usgs_gdf.copy()
+    gdf['_station_key'] = gdf[station_col].astype(str)
+    linkage = comid_linkage[['STAID', 'COMID']].copy()
+    linkage['_station_key'] = linkage['STAID'].astype(str)
+
+    merged = gdf.merge(
+        linkage[['_station_key', 'COMID']].rename(columns={'COMID': '_matched_comid'}),
+        on='_station_key',
+        how='inner',
+    )
+
+    if len(merged) == 0:
+        if verbose:
+            print("Warning: No USGS gauges match available COMIDs")
+        return [], gpd.GeoDataFrame()
+
+    # Drop duplicate stations (e.g. one station linked to several COMIDs,
+    # or repeated gauge rows) so each returned row is a unique station
+    n_before = len(merged)
+    merged = merged.drop_duplicates(subset='_station_key', keep='first')
+    n_duplicates = n_before - len(merged)
+    if n_duplicates > 0:
+        warnings.warn(
+            f"Dropped {n_duplicates} duplicate station match(es) when "
+            f"matching USGS gauges to NWM COMIDs; kept the first COMID "
+            f"per station"
+        )
+
+    merged['comid'] = merged['_matched_comid'].astype(int)
+    matched_usgs_gdf = merged.drop(
+        columns=['_station_key', '_matched_comid']
+    ).reset_index(drop=True)
+    usgs_comids = matched_usgs_gdf['comid'].tolist()
 
     if verbose:
         print(f"✓ Matched {len(usgs_comids)} USGS gauges to NWM COMIDs")

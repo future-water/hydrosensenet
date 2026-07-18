@@ -21,7 +21,27 @@ class SensorNetworkDesigner:
         locations: gpd.GeoDataFrame,
         location_labels: Optional[List[str]] = None
     ):
-        """Initialize sensor network designer."""
+        """Initialize sensor network designer.
+
+        Parameters
+        ----------
+        streamflow_data : np.ndarray
+            Matrix of shape ``(n_timesteps, n_locations)``; each column
+            is one candidate location's time series.
+        locations : gpd.GeoDataFrame
+            One row per column of ``streamflow_data``, in the same
+            order.
+        location_labels : list of str, optional
+            Label per location (e.g. gauge IDs or COMIDs). Defaults to
+            stringified column positions (or column names for DataFrame
+            input).
+        """
+        if hasattr(streamflow_data, "values"):  # DataFrame input
+            if location_labels is None:
+                location_labels = [str(c) for c in streamflow_data.columns]
+            streamflow_data = streamflow_data.values
+        streamflow_data = np.asarray(streamflow_data)
+
         self.streamflow_data = streamflow_data
         self.locations = locations
         self.location_labels = location_labels or [str(i) for i in range(streamflow_data.shape[1])]
@@ -31,6 +51,11 @@ class SensorNetworkDesigner:
             raise ValueError(
                 f"Streamflow data has {streamflow_data.shape[1]} locations but "
                 f"locations GeoDataFrame has {len(locations)} rows"
+            )
+        if len(self.location_labels) != streamflow_data.shape[1]:
+            raise ValueError(
+                f"Got {len(self.location_labels)} location_labels for "
+                f"{streamflow_data.shape[1]} locations"
             )
 
     @classmethod
@@ -138,12 +163,62 @@ class SensorNetworkDesigner:
         n_sensors: int,
         weights: Optional[Union[np.ndarray, str, Path]] = None,
         weight_column: Optional[str] = None,
+        weight_fill_value: float = 0.0,
         existing_sensors: Optional[List[int]] = None,
         train_frac: float = 0.7,
         evaluate: bool = True,
         verbose: bool = True
     ) -> 'NetworkDesignResult':
-        """Design optimal sensor network."""
+        """Design an optimal sensor network.
+
+        Splits the record in time (when ``evaluate=True``), selects
+        sensor locations by weighted pivoted QR on the training block,
+        and scores reconstruction of the full field on the held-out
+        block.
+
+        Parameters
+        ----------
+        n_sensors : int
+            Number of sensors to place (including ``existing_sensors``).
+        weights : np.ndarray or str or Path, optional
+            Per-location weights aligned to the data columns, or a path
+            to a spatial weight file resolved via
+            :func:`~hydrosensenet.calculate_spatial_weights`.
+        weight_column : str, optional
+            Column to read when ``weights`` is a file path.
+        weight_fill_value : float, default=0.0
+            Fill for locations not covered by the weight file. The
+            default ``0.0`` removes uncovered locations from
+            consideration; use a tiny positive value (e.g. ``1e-10``)
+            to keep them selectable as a last resort.
+        existing_sensors : list of int, optional
+            Column indices of gauges to keep (indices into the original
+            column order). They appear first in the result; if
+            ``len(existing_sensors) == n_sensors`` the QR step is
+            skipped and the existing network is just evaluated.
+        train_frac : float, default=0.7
+            Fraction of timesteps used for design when evaluating.
+        evaluate : bool, default=True
+            Hold out ``1 - train_frac`` of the record and compute
+            reconstruction metrics (NSE, NNSE, relative error).
+        verbose : bool, default=True
+            Print progress information.
+
+        Returns
+        -------
+        NetworkDesignResult
+            Selected indices, locations, labels, and (if evaluated)
+            per-location performance metrics.
+
+        Notes
+        -----
+        Columns containing NaN/inf in the training block are dropped
+        before selection (a warning reports how many). All indices in
+        the returned result refer to the **original** column order, and
+        per-location metric arrays have the original length with NaN at
+        dropped locations. An ``existing_sensors`` entry pointing at a
+        dropped column raises a ``ValueError``.
+        """
         import time
 
         if verbose:
@@ -154,7 +229,9 @@ class SensorNetworkDesigner:
             print(f"Target sensors: {n_sensors}")
             print(f"Evaluation: {'Enabled' if evaluate else 'Disabled'}")
 
-        # Process weights
+        n_locations = self.streamflow_data.shape[1]
+
+        # Process weights (built against the original, unfiltered columns)
         if weights is not None:
             if verbose:
                 print(f"\n[1/4] Processing weights...")
@@ -162,41 +239,96 @@ class SensorNetworkDesigner:
                 weight_array = calculate_spatial_weights(
                     self.locations,
                     weights,
-                    weight_column=weight_column
+                    weight_column=weight_column,
+                    fill_value=weight_fill_value
                 )
             elif isinstance(weights, np.ndarray):
                 weight_array = weights
             else:
                 raise TypeError("weights must be array or file path")
+            if len(weight_array) != n_locations:
+                raise ValueError(
+                    f"Weights length ({len(weight_array)}) must match number "
+                    f"of locations ({n_locations})"
+                )
             if verbose:
                 print(f"      ✓ Weights applied")
         else:
             weight_array = None
 
-        # Split data if evaluation requested
+        # Split data if evaluation requested. Columns with NaN/inf in the
+        # training block are dropped in BOTH paths; good_cols maps the
+        # filtered column space back to original column indices.
         if evaluate:
             if verbose:
                 print(f"\n[2/4] Splitting data (train: {train_frac:.0%}, test: {1-train_frac:.0%})...")
             start_time = time.time()
-            X_train, X_test = split_timeseries(
+            X_train, X_test, mapping = split_timeseries(
                 self.streamflow_data,
                 train_frac=train_frac,
-                filter_invalid=True
+                filter_invalid=True,
+                return_mapping=True
             )
+            good_cols = np.asarray(mapping["good_cols"])
             if verbose:
                 print(f"      ✓ Train: {X_train.shape[0]:,} × {X_train.shape[1]:,}")
                 print(f"      ✓ Test:  {X_test.shape[0]:,} × {X_test.shape[1]:,}")
                 print(f"      Completed in {time.time() - start_time:.2f}s")
         else:
-            X_train = self.streamflow_data
+            finite_cols = np.isfinite(self.streamflow_data).all(axis=0)
+            good_cols = np.where(finite_cols)[0]
+            X_train = (
+                self.streamflow_data[:, good_cols]
+                if len(good_cols) < n_locations else self.streamflow_data
+            )
             X_test = None
 
+        n_dropped = n_locations - len(good_cols)
+        if n_dropped:
+            warnings.warn(
+                f"{n_dropped} of {n_locations} locations contain NaN/inf in "
+                f"the training data and were excluded from selection.",
+                UserWarning,
+                stacklevel=2,
+            )
+            if verbose:
+                print(f"      ⚠ Excluded {n_dropped} locations with NaN/inf values")
+        if n_sensors > len(good_cols):
+            raise ValueError(
+                f"Requested {n_sensors} sensors but only {len(good_cols)} "
+                f"locations have valid (finite) training data"
+            )
+
+        # Weights and existing sensors are given in original column space;
+        # translate them into the filtered space used for selection.
+        weight_array_filtered = (
+            weight_array[good_cols] if (weight_array is not None and n_dropped) else weight_array
+        )
+        if existing_sensors is not None:
+            existing_sensors = [int(i) for i in existing_sensors]
+            out_of_range = [i for i in existing_sensors if not 0 <= i < n_locations]
+            if out_of_range:
+                raise ValueError(f"existing_sensors indices out of range: {out_of_range}")
+            if n_dropped:
+                orig_to_filtered = {int(orig): k for k, orig in enumerate(good_cols)}
+                dropped_fixed = [i for i in existing_sensors if i not in orig_to_filtered]
+                if dropped_fixed:
+                    raise ValueError(
+                        f"existing_sensors columns {dropped_fixed} contain NaN/inf "
+                        f"in the training data and cannot be evaluated"
+                    )
+                fixed_filtered = [orig_to_filtered[i] for i in existing_sensors]
+            else:
+                fixed_filtered = existing_sensors
+        else:
+            fixed_filtered = None
+
         # Perform sensor placement (skip if all sensors are already specified)
-        if existing_sensors is not None and len(existing_sensors) == n_sensors:
+        if fixed_filtered is not None and len(fixed_filtered) == n_sensors:
             # Skip QR - we're just evaluating existing sensors
             if verbose:
                 print(f"\n[3/4] Using {n_sensors} existing sensor locations (skipping QR)...")
-            selected_indices = np.array(existing_sensors)
+            selected_filtered = np.array(fixed_filtered)
         else:
             # Run QR decomposition to find optimal locations
             if verbose:
@@ -205,17 +337,22 @@ class SensorNetworkDesigner:
                 print(f"      This may take several minutes for large datasets...")
                 start_time = time.time()
 
-            selected_indices = sensor_placement_qr(
+            selected_filtered = sensor_placement_qr(
                 X_train,
                 n_sensors=n_sensors,
-                weights=weight_array,
-                fixed_indices=existing_sensors,
+                weights=weight_array_filtered,
+                fixed_indices=fixed_filtered,
                 verbose=verbose
             )
 
             if verbose:
                 print(f"      ✓ QR decomposition completed in {time.time() - start_time:.2f}s")
-                print(f"      ✓ Selected {len(selected_indices)} sensor locations")
+                print(f"      ✓ Selected {len(selected_filtered)} sensor locations")
+
+        # Map selection back to original column indices
+        selected_indices = (
+            good_cols[selected_filtered] if n_dropped else np.asarray(selected_filtered)
+        )
 
         # Evaluate if requested
         if evaluate and X_test is not None:
@@ -224,12 +361,20 @@ class SensorNetworkDesigner:
                 start_time = time.time()
 
             eval_results = reconstruction_evaluation(
-                X_train, X_test, selected_indices, n_sensors, verbose=verbose
+                X_train, X_test, np.asarray(selected_filtered), n_sensors, verbose=verbose
             )
 
-            # Use pre-calculated NSE/NNSE from eval_results (avoids redundant computation)
-            nse = eval_results['nse']
-            nnse = eval_results['nnse']
+            # Per-location metric arrays are computed in filtered space;
+            # expand them to original length (NaN at dropped columns) so
+            # they can be indexed with original column indices.
+            def _expand(values):
+                full = np.full(n_locations, np.nan)
+                full[good_cols] = values
+                return full
+
+            nse = _expand(eval_results['nse'])
+            nnse = _expand(eval_results['nnse'])
+            eval_results['good_cols'] = good_cols
             r2 = None  # Skip R² calculation (same as NSE)
 
             if verbose:
@@ -263,7 +408,25 @@ class SensorNetworkDesigner:
 
 
 class NetworkDesignResult:
-    """Results from sensor network design."""
+    """Results from sensor network design.
+
+    Attributes
+    ----------
+    selected_indices : np.ndarray
+        Selected column indices in priority order (rank 1 first).
+    locations : gpd.GeoDataFrame
+        Rows of the input locations for the selected sensors.
+    location_labels : list of str
+        Labels of the selected sensors, in the same order.
+    performance_metrics : dict or None
+        When designed with ``evaluate=True``: per-location ``nse`` and
+        ``nnse`` arrays plus the raw ``eval_results`` dict from
+        :func:`~hydrosensenet.reconstruction_evaluation`.
+    n_sensors : int
+        Number of sensors requested.
+    weights : np.ndarray or None
+        Weight vector used for the design, if any.
+    """
 
     def __init__(
         self,
@@ -432,11 +595,18 @@ class NetworkDesignResult:
         rank_column='Median Rank'
     ):
         """Create map visualization of selected sensors."""
-        import matplotlib.pyplot as plt
-        import cartopy.crs as ccrs
-        import cartopy.feature as cfeature
-        from matplotlib.collections import LineCollection
-        from matplotlib.colors import Normalize
+        try:
+            import matplotlib.pyplot as plt
+            import cartopy.crs as ccrs
+            import cartopy.feature as cfeature
+            from matplotlib.collections import LineCollection
+            from matplotlib.colors import Normalize
+        except ImportError as e:
+            raise ImportError(
+                "Plotting requires the optional visualization dependencies "
+                "(matplotlib, cartopy). Install them with:\n"
+                "  pip install 'hydrosensenet[viz]'"
+            ) from e
 
         # Use Lambert Conformal projection if flowlines provided, otherwise PlateCarree
         if flowlines_gdf is not None:
@@ -632,11 +802,18 @@ class NetworkDesignResult:
         tuple
             (figure, axis)
         """
-        import matplotlib.pyplot as plt
-        import cartopy.crs as ccrs
-        import cartopy.feature as cfeature
-        from matplotlib.collections import LineCollection
-        from matplotlib.colors import Normalize
+        try:
+            import matplotlib.pyplot as plt
+            import cartopy.crs as ccrs
+            import cartopy.feature as cfeature
+            from matplotlib.collections import LineCollection
+            from matplotlib.colors import Normalize
+        except ImportError as e:
+            raise ImportError(
+                "Plotting requires the optional visualization dependencies "
+                "(matplotlib, cartopy). Install them with:\n"
+                "  pip install 'hydrosensenet[viz]'"
+            ) from e
 
         # Default labels
         if comparison_labels is None:

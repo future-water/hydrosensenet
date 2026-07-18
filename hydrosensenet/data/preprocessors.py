@@ -1,5 +1,7 @@
 """Data preprocessing utilities for sensor network optimization."""
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -13,6 +15,8 @@ def split_timeseries(
     return_mapping: bool = False
 ) -> Union[Tuple, Tuple[any, any, Dict]]:
     """Split time series data into training and testing sets."""
+    if not 0 < train_frac < 1:
+        raise ValueError(f"train_frac must be in (0, 1), got {train_frac}")
     if isinstance(data, np.ndarray):
         return _split_array(data, train_frac, filter_invalid, return_mapping)
     elif isinstance(data, pd.DataFrame):
@@ -34,16 +38,23 @@ def _split_array(
 ):
     """Split numpy array."""
     n_train = int(train_frac * data.shape[0])
+    if n_train == 0 or n_train == data.shape[0]:
+        raise ValueError(
+            f"train_frac={train_frac} with {data.shape[0]} timesteps yields "
+            f"an empty train or test set"
+        )
     train_data = data[:n_train, :]
     test_data = data[n_train:, :]
 
     if filter_invalid:
-        # Filter columns with NaN/inf in training
+        # Filter columns with NaN/inf in training (no copy when all valid)
         finite_mask = np.isfinite(train_data).all(axis=0)
-        good_cols = np.where(finite_mask)[0]
-
-        train_data = train_data[:, good_cols]
-        test_data = test_data[:, good_cols]
+        if finite_mask.all():
+            good_cols = np.arange(data.shape[1])
+        else:
+            good_cols = np.where(finite_mask)[0]
+            train_data = train_data[:, good_cols]
+            test_data = test_data[:, good_cols]
 
         if return_mapping:
             mapping = {
@@ -72,6 +83,11 @@ def _split_dataframe(
 ):
     """Split pandas DataFrame."""
     n_train = int(train_frac * len(data))
+    if n_train == 0 or n_train == len(data):
+        raise ValueError(
+            f"train_frac={train_frac} with {len(data)} timesteps yields "
+            f"an empty train or test set"
+        )
     train_data = data.iloc[:n_train, :]
     test_data = data.iloc[n_train:, :]
 
@@ -112,6 +128,13 @@ def _split_dataset(
     test_data = data.isel({time_dim: slice(n_train, None)})
 
     # Filtering for xarray is more complex, skipping for now
+    if filter_invalid:
+        warnings.warn(
+            "filter_invalid is not supported for xarray Datasets; "
+            "returning unfiltered splits",
+            UserWarning,
+            stacklevel=3,
+        )
     if return_mapping:
         mapping = {"n_removed": 0}
         return train_data, test_data, mapping

@@ -44,6 +44,11 @@ def save_streamflow(
             if not suffix:
                 path = path.with_suffix('.parquet')
 
+    if format not in ("parquet", "csv"):
+        raise ValueError(
+            f"Unknown format: {format!r}. Expected 'auto', 'parquet', or 'csv'."
+        )
+
     # Create parent directory if needed
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -88,6 +93,11 @@ def load_streamflow(
         else:
             raise ValueError(f"Cannot auto-detect format from extension: {suffix}")
 
+    if format not in ("parquet", "csv"):
+        raise ValueError(
+            f"Unknown format: {format!r}. Expected 'auto', 'parquet', or 'csv'."
+        )
+
     # Load with appropriate format
     if format == "parquet":
         parquet_kwargs = {'engine': 'pyarrow'}
@@ -98,11 +108,22 @@ def load_streamflow(
 
     elif format == "csv":
         csv_kwargs = {'index_col': 0, 'parse_dates': True}
-        # Handle column selection for CSV (less efficient)
-        if columns:
-            csv_kwargs['usecols'] = [csv_kwargs['index_col']] + columns
         csv_kwargs.update(kwargs)
+        # Handle column selection for CSV (less efficient)
+        select = columns and 'usecols' not in kwargs
+        if select:
+            # pandas rejects a usecols list that mixes a positional
+            # index_col with column names, so resolve the index column's
+            # name from the header first.
+            index_col = csv_kwargs['index_col']
+            if isinstance(index_col, int) and not isinstance(index_col, bool):
+                index_col = pd.read_csv(path, nrows=0).columns[index_col]
+                csv_kwargs['index_col'] = index_col
+            csv_kwargs['usecols'] = [index_col] + list(columns)
         df = pd.read_csv(path, **csv_kwargs)
+        if select:
+            # Match parquet behavior: return columns in requested order
+            df = df[list(columns)]
 
     return df
 
@@ -130,6 +151,12 @@ def save_locations(
         format = format_map.get(suffix, 'parquet')
         if suffix not in format_map:
             path = path.with_suffix('.parquet')
+
+    if format not in ("parquet", "csv", "geojson", "shapefile"):
+        raise ValueError(
+            f"Unknown format: {format!r}. Expected 'auto', 'parquet', 'csv', "
+            f"'geojson', or 'shapefile'."
+        )
 
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -212,12 +239,21 @@ def load_locations(
         if format is None:
             raise ValueError(f"Cannot auto-detect format from extension: {suffix}")
 
+    if format not in ("parquet", "csv", "geojson", "shapefile"):
+        raise ValueError(
+            f"Unknown format: {format!r}. Expected 'auto', 'parquet', 'csv', "
+            f"'geojson', or 'shapefile'."
+        )
+
     # Load with appropriate format
     if format == "parquet":
-        # Try GeoParquet first, fall back to regular parquet
+        # Try GeoParquet first, fall back to regular parquet.
+        # geopandas raises ValueError for parquet files without geo
+        # metadata; any other error (missing pyarrow, I/O failure)
+        # should propagate unchanged.
         try:
             return gpd.read_parquet(path, **kwargs)
-        except Exception:
+        except ValueError:
             return pd.read_parquet(path, **kwargs)
     elif format in ["geojson", "shapefile"]:
         return gpd.read_file(path, **kwargs)
@@ -326,7 +362,7 @@ def migrate_directory(
     ----------
     directory : str or Path
         Directory containing CSV files.
-    pattern : str, default="*.csv"
+    pattern : str, default ``"*.csv"``
         Glob pattern for CSV files.
     compression : str, default="snappy"
         Compression algorithm.

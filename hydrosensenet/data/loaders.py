@@ -1,5 +1,7 @@
 """Universal data loaders for streamflow and gauge data."""
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -78,21 +80,38 @@ def _load_csv(
     """Load CSV file(s)."""
     dfs = []
     for file in files:
-        # Try to auto-detect time column
+        # Single read; the time column is promoted to the index afterwards
         df = pd.read_csv(file, **kwargs)
 
-        # Handle common unnamed index column
+        # Determine which column should become the (datetime) index
+        index_col = None
+        unnamed = False
         if df.columns[0].startswith('Unnamed'):
-            df = pd.read_csv(file, index_col=0, parse_dates=True, **kwargs)
+            # Handle common unnamed index column
+            index_col = df.columns[0]
+            unnamed = True
         elif time_col:
-            df = pd.read_csv(file, index_col=time_col, parse_dates=True, **kwargs)
+            index_col = time_col
         else:
             # Auto-detect common time column names
             time_aliases = ['time', 'Time', 'datetime', 'date', 'Date', 'timestamp']
             for alias in time_aliases:
                 if alias in df.columns:
-                    df = pd.read_csv(file, index_col=alias, parse_dates=True, **kwargs)
+                    index_col = alias
                     break
+
+        if index_col is not None:
+            df = df.set_index(index_col)
+            if unnamed:
+                df.index.name = None
+            try:
+                with warnings.catch_warnings():
+                    # Speculative parse; silence format-inference chatter
+                    warnings.simplefilter("ignore")
+                    df.index = pd.to_datetime(df.index)
+            except (ValueError, TypeError):
+                # Mirror parse_dates=True: keep the index as-is if unparseable
+                pass
 
         dfs.append(df)
 
@@ -218,6 +237,16 @@ def prepare_gauge_locations(
             if gdf.crs != crs:
                 gdf = gdf.to_crs(crs)
             return gdf
+        elif path.suffix.lower() in ['.parquet', '.pq']:
+            try:
+                gdf = gpd.read_parquet(path)
+            except (ValueError, ImportError):
+                # Plain (non-geo) parquet: fall through to the lat/lon logic
+                df = pd.read_parquet(path)
+            else:
+                if gdf.crs != crs:
+                    gdf = gdf.to_crs(crs)
+                return gdf
         elif path.suffix.lower() in ['.csv', '.txt']:
             df = pd.read_csv(path)
         elif path.suffix.lower() in ['.xlsx', '.xls']:
@@ -256,14 +285,25 @@ def prepare_gauge_locations(
         )
 
     # Drop rows with missing coordinates
+    n_rows = len(df)
     df = df.dropna(subset=[actual_lat, actual_lon])
+    n_dropped = n_rows - len(df)
+    if n_dropped > 0:
+        warnings.warn(
+            f"Dropped {n_dropped} row(s) with missing coordinates; "
+            f"positional alignment with a streamflow matrix's columns "
+            f"is broken.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     # Rename to standard names
     df = df.rename(columns={actual_lat: "latitude", actual_lon: "longitude"})
 
     # Create or rename ID column
     if id_col is None:
-        df["gauge_id"] = np.arange(len(df))
+        if "gauge_id" not in df.columns:
+            df["gauge_id"] = np.arange(len(df))
     elif id_col in df.columns:
         df = df.rename(columns={id_col: "gauge_id"})
     else:

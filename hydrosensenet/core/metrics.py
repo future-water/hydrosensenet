@@ -8,7 +8,26 @@ def calculate_performance_metrics(
     true_values: np.ndarray,
     pred_values: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Calculate R-squared, NSE, and normalized NSE metrics."""
+    """Calculate per-location NSE and normalized NSE (NNSE) skill scores.
+
+    Parameters
+    ----------
+    true_values, pred_values : np.ndarray
+        Arrays of shape ``(n_timesteps, n_locations)``.
+
+    Returns
+    -------
+    r_squared : np.ndarray
+        Coefficient of determination per location. Computed with the
+        NSE formula (1 - SSE/SST against the observed mean), so it is
+        numerically identical to ``nse``.
+    nse : np.ndarray
+        Nash-Sutcliffe efficiency per location, in ``(-inf, 1]``.
+        ``NaN`` where the true series is constant (zero variance).
+    nnse : np.ndarray
+        Normalized NSE, ``1 / (2 - NSE)``, mapping ``(-inf, 1]`` to
+        ``(0, 1]`` — convenient for mapping and aggregation.
+    """
     # Calculate sum of squared residuals
     ss_res = np.sum((true_values - pred_values) ** 2, axis=0)
 
@@ -99,39 +118,31 @@ def reconstruction_evaluation(
     X_train_selected = X_train[:, selected_sensors]  # (n_train, n_sensors)
     X_test_selected = X_test[:, selected_sensors]    # (n_test, n_sensors)
 
-    # Reconstruct full field using least squares
-    # FAST METHOD: Avoid creating huge (n_train × n_test) intermediate matrix
-    # Instead solve a small (n_sensors × n_sensors) system
-    # This is 100-1000x faster for large datasets!
-
+    # Reconstruct the full field with the least-squares operator learned on
+    # training data: B = argmin ||S_train B - X_train||_F, applied as
+    # X_recon = S_test @ B. The tall system is solved directly (SVD-based
+    # lstsq): forming the Gram matrix S^T S instead would square the
+    # condition number and lose half the significant digits for
+    # ill-conditioned sensor subsets.
     if verbose:
-        print(f"      - Computing Gram matrix ({n_sensors} × {n_sensors})...")
+        print(f"      - Solving least-squares reconstruction operator...")
 
-    # G = S^T S  (n_sensors × n_sensors)
-    G = X_train_selected.T @ X_train_selected
-
-    if verbose:
-        print(f"      - Solving linear system for reconstruction...")
-
-    # Solve G Y = T^T  => Y (n_sensors × n_test)
-    # Use lstsq for robustness - handles singular/rank-deficient matrices
-    Y, residuals, rank, s = np.linalg.lstsq(G, X_test_selected.T, rcond=None)
+    B, _, rank, _ = np.linalg.lstsq(X_train_selected, X_train, rcond=None)
 
     if verbose and rank < n_sensors:
-        print(f"      ⚠ Warning: Gram matrix is rank-deficient (rank={rank}, expected={n_sensors})")
+        print(f"      ⚠ Warning: sensor matrix is rank-deficient (rank={rank}, expected={n_sensors})")
         print(f"        This suggests some sensors provide redundant information.")
 
     if verbose:
         print(f"      - Reconstructing full field ({X_test.shape[0]:,} × {N_locations:,})...")
 
-    # Precompute M = S^T X_train  (n_sensors × n_locations)
-    M = X_train_selected.T @ X_train
+    # X_recon = S_test @ B  (n_test × n_locations)
+    X_test_reconstructed = X_test_selected @ B
 
-    # X_recon = Y^T M  (n_test × n_locations)
-    X_test_reconstructed = Y.T @ M
-
-    # Ensure non-negative for physical variables
-    X_test_reconstructed = np.maximum(X_test_reconstructed, 1e-10)
+    # Clamp to the physical range only when the data itself is non-negative
+    # (e.g. streamflow); general anomaly fields keep negative values.
+    if np.min(X_train) >= 0 and np.min(X_test) >= 0:
+        X_test_reconstructed = np.maximum(X_test_reconstructed, 0.0)
 
     if verbose:
         print(f"      - Calculating error metrics...")

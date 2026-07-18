@@ -15,7 +15,7 @@ Quick Start
 >>> result.export("sensor_locations.csv")
 """
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 __author__ = "Jeil Oh, John Lee, Matthew Bartos"
 
 # ============================================================================
@@ -60,39 +60,49 @@ from .io import (
     migrate_directory,
 )
 
+# Bundled example data
+from .datasets import load_example_basin
+
 # ============================================================================
-# LEGACY API (For backwards compatibility - will be deprecated in v1.0)
+# LEGACY API (For backwards compatibility - will be removed in v1.0)
 # ============================================================================
-import warnings
+# The legacy modules pull in heavy optional dependencies (cartopy,
+# matplotlib) at import time, so they are loaded lazily via PEP 562
+# module __getattr__ instead of eagerly here.
+_LEGACY_ATTRS = {
+    "sensor_network_utils": "sensor_network_utils",
+    "glofas_processing_utils": "glofas_processing_utils",
+    "load_data": "sensor_network_utils",
+    "prepare_usgs_indices": "sensor_network_utils",
+}
 
-def _deprecated_import(name):
-    """Helper to show deprecation warnings."""
-    warnings.warn(
-        f"{name} is deprecated and will be removed in v1.0. "
-        f"Use the new modular API or SensorNetworkDesigner instead.",
-        DeprecationWarning,
-        stacklevel=3
-    )
 
-# Legacy imports from old modules (with deprecation warnings)
-try:
-    from . import sensor_network_utils as _legacy_snu
-    from . import glofas_processing_utils as _legacy_gpu
+def __getattr__(name):
+    if name in _LEGACY_ATTRS:
+        import importlib
+        import warnings
 
-    # Create wrapper functions that show deprecation warnings
-    def load_data(*args, **kwargs):
-        _deprecated_import("load_data")
-        return _legacy_snu.load_data(*args, **kwargs)
+        warnings.warn(
+            f"{name} is deprecated and will be removed in v1.0. "
+            "Use the new modular API or SensorNetworkDesigner instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        module_name = _LEGACY_ATTRS[name]
+        try:
+            module = importlib.import_module(f".{module_name}", __name__)
+        except ImportError as e:
+            raise ImportError(
+                f"The legacy module {module_name!r} requires the optional "
+                "visualization dependencies (matplotlib, cartopy). "
+                "Install them with:\n"
+                "  pip install 'hydrosensenet[viz]'"
+            ) from e
+        if name == module_name:
+            return module
+        return getattr(module, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-    def prepare_usgs_indices(*args, **kwargs):
-        _deprecated_import("prepare_usgs_indices")
-        return _legacy_snu.prepare_usgs_indices(*args, **kwargs)
-
-    # Add other legacy functions as needed...
-
-except ImportError:
-    # Legacy modules not available - that's fine
-    pass
 
 # ============================================================================
 # PUBLIC API
@@ -126,4 +136,7 @@ __all__ = [
     "load_locations",
     "migrate_csv_to_parquet",
     "migrate_directory",
+
+    # EXAMPLE DATA
+    "load_example_basin",
 ]
