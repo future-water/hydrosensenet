@@ -1,0 +1,10 @@
+/* Hide the theme's "Made with Furo" credit while keeping the
+   copyright line (the credit is a bare text node, so collapse the
+   container's font size and restore it on the copyright child). */
+.bottom-of-page .left-details {
+    font-size: 0;
+}
+
+.bottom-of-page .left-details .copyright {
+    font-size: var(--font-size--small);
+}
