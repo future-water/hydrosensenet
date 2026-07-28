@@ -75,7 +75,7 @@ print(locations[["gauge_id", "latitude", "longitude"]])  # 4 rows, EPSG:4326
 
 ## Fast saving and loading: the io module
 
-For data you write yourself, prefer the `hydrosensenet.io` functions. They
+For efficient data storage and I/O, use the `hydrosensenet.io` functions. They
 default to Parquet (snappy-compressed, pyarrow engine), typically far
 smaller and faster than CSV for wide streamflow tables.
 {func}`hydrosensenet.io.save_streamflow` appends `.parquet` when the path
