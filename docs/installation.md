@@ -15,7 +15,7 @@ pip install "hydrosensenet[viz]"   # map plotting (matplotlib, cartopy)
 pip install "hydrosensenet[nwm]"   # NWM download stack (fsspec, dask, pynhd, s3fs, zarr)
 ```
 
-Features that need extra installations tell you which one to install when you call
+Features that need extras tell you which one to install when you call
 them — for example `NetworkDesignResult.plot()` raises an error
 suggesting `hydrosensenet[viz]` if matplotlib/cartopy are missing.
 
