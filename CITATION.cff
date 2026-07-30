@@ -1,0 +1,50 @@
+# This CITATION.cff file was created for hydrosensenet.
+# Validate with: cffconvert --validate
+cff-version: 1.2.0
+message: >-
+  If you use this software, please cite both the software itself and the
+  method paper listed under preferred-citation.
+type: software
+title: hydrosensenet
+version: 0.2.0
+abstract: >-
+  An open-source Python package for optimal hydrological monitoring network
+  design using pivoted QR decomposition, with National Water Model ingestion,
+  USGS gauge matching, and FEMA National Risk Index weighting.
+authors:
+  # TODO: confirm ORCID iDs for all authors and add them as `orcid:` entries.
+  - given-names: Jeil
+    family-names: Oh
+    affiliation: >-
+      Center for Water and the Environment, University of Texas at Austin
+  - given-names: John
+    family-names: Lee
+    affiliation: University of Texas at Austin
+  - given-names: Matthew
+    family-names: Bartos
+    affiliation: University of Texas at Austin
+repository-code: https://github.com/future-water/hydrosensenet
+url: https://future-water.org/hydrosensenet/
+license: BSD-3-Clause
+keywords:
+  - hydrology
+  - sensor networks
+  - streamgauge
+  - optimization
+  - QR decomposition
+preferred-citation:
+  type: article
+  title: >-
+    Scalable, Adaptive, and Risk-Informed Design of Hydrological Sensor
+    Networks
+  authors:
+    - given-names: Jeil
+      family-names: Oh
+      affiliation: >-
+        Center for Water and the Environment, University of Texas at Austin
+    - given-names: Matthew
+      family-names: Bartos
+      affiliation: University of Texas at Austin
+  year: 2025
+  doi: 10.21203/rs.3.rs-6038740/v1
+  notes: Preprint; under review at Nature Water.
