@@ -43,8 +43,9 @@ scalable approach:
   metrics (NSE, NNSE, reconstruction error) built in.
 
 The methodology is described in
-[Oh & Bartos (2025), *Scalable, Adaptive, and Risk-Informed Design of
-Hydrological Sensor Networks*](https://doi.org/10.21203/rs.3.rs-6038740/v1).
+[Oh & Bartos (2025), *Scalable, adaptive and risk-informed design of
+hydrological sensor networks*, Nature Water
+3, 1144–1154](https://doi.org/10.1038/s44221-025-00496-7).
 
 ## Quick example
 

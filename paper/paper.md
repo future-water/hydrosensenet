@@ -9,17 +9,19 @@ tags:
   - QR decomposition
 authors:
   - name: Jeil Oh
-    # TODO: add ORCID iDs for all authors
+    orcid: 0000-0002-5367-993X
     corresponding: true
     affiliation: 1
   - name: John Lee
-    # TODO: confirm John Lee's affiliation (assumed Center for Water and the Environment, UT Austin)
+    # TODO: confirm John Lee's ORCID and affiliation
     affiliation: 1
   - name: Matthew Bartos
-    # TODO: confirm Matthew Bartos's affiliation (assumed Center for Water and the Environment, UT Austin)
+    orcid: 0000-0001-6421-222X
     affiliation: 1
 affiliations:
-  - name: Center for Water and the Environment, The University of Texas at Austin, United States
+  - name: >-
+      Fariborz Maseeh Department of Civil, Architectural and Environmental
+      Engineering, The University of Texas at Austin, United States
     index: 1
 date: 30 July 2026
 bibliography: paper.bib

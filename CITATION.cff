@@ -12,17 +12,22 @@ abstract: >-
   design using pivoted QR decomposition, with National Water Model ingestion,
   USGS gauge matching, and FEMA National Risk Index weighting.
 authors:
-  # TODO: confirm ORCID iDs for all authors and add them as `orcid:` entries.
   - given-names: Jeil
     family-names: Oh
+    orcid: https://orcid.org/0000-0002-5367-993X
     affiliation: >-
-      Center for Water and the Environment, University of Texas at Austin
+      Fariborz Maseeh Department of Civil, Architectural and Environmental
+      Engineering, The University of Texas at Austin
+  # TODO: confirm John Lee's ORCID and affiliation
   - given-names: John
     family-names: Lee
-    affiliation: University of Texas at Austin
+    affiliation: The University of Texas at Austin
   - given-names: Matthew
     family-names: Bartos
-    affiliation: University of Texas at Austin
+    orcid: https://orcid.org/0000-0001-6421-222X
+    affiliation: >-
+      Fariborz Maseeh Department of Civil, Architectural and Environmental
+      Engineering, The University of Texas at Austin
 repository-code: https://github.com/future-water/hydrosensenet
 url: https://future-water.org/hydrosensenet/
 license: BSD-3-Clause
@@ -35,16 +40,19 @@ keywords:
 preferred-citation:
   type: article
   title: >-
-    Scalable, Adaptive, and Risk-Informed Design of Hydrological Sensor
-    Networks
+    Scalable, adaptive and risk-informed design of hydrological sensor
+    networks
   authors:
     - given-names: Jeil
       family-names: Oh
-      affiliation: >-
-        Center for Water and the Environment, University of Texas at Austin
-    - given-names: Matthew
+      orcid: https://orcid.org/0000-0002-5367-993X
+    - given-names: Matt
       family-names: Bartos
-      affiliation: University of Texas at Austin
+      orcid: https://orcid.org/0000-0001-6421-222X
+  journal: Nature Water
   year: 2025
-  doi: 10.21203/rs.3.rs-6038740/v1
-  notes: Preprint; under review at Nature Water.
+  volume: 3
+  issue: 10
+  start: 1144
+  end: 1154
+  doi: 10.1038/s44221-025-00496-7
